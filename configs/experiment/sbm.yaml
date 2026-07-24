@@ -13,7 +13,7 @@ general:
     final_model_samples_to_generate: 40
     final_model_samples_to_save: 30
     final_model_chains_to_save: 20
-    sample_steps: 1000
+    # sample_steps: 1000 this is a dead code anishok
 train:
     n_epochs: 50000
     batch_size: 32

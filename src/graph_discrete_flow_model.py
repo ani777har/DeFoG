@@ -244,11 +244,13 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             self.search_hyperparameters()
         else:
             print("Starting to sample")
+            t0 = time.time()
             samples, labels = self.sample(
                 is_test=True,
                 save_samples=self.cfg.general.save_samples,
-                save_visualization=True,
+                save_visualization=False, # anishok
             )
+            print(f"[timing] generation: {time.time() - t0:.2f}s for {len(samples)} graphs")
             to_log = self.evaluate_samples(samples=samples, labels=labels, is_test=True)
 
             # Store results
@@ -275,6 +277,10 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         # Otherwise, generate new samples
         if is_test:
+            if self.cfg.general.bootstrapping and self.cfg.general.num_sample_fold != 1:
+                raise ValueError(
+                    "When bootstrapping is enabled, num_sample_fold must be 1."
+                )
             samples_to_generate = (
                 self.cfg.general.final_model_samples_to_generate
                 * self.cfg.general.num_sample_fold
@@ -364,13 +370,24 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         to_log = {}
         samples_to_evaluate = self.cfg.general.final_model_samples_to_generate
         if is_test:
-            for i in range(self.cfg.general.num_sample_fold):
-                cur_samples = samples[
-                    i * samples_to_evaluate : (i + 1) * samples_to_evaluate
+            if self.cfg.general.bootstrapping:
+                num_bootstrap_fold = 5
+                n_total = len(samples)
+                holdout = n_total // num_bootstrap_fold
+                fold_indices = [
+                    np.random.choice(n_total, size=n_total - holdout, replace=False)
+                    for _ in range(num_bootstrap_fold)
                 ]
-                cur_labels = labels[
-                    i * samples_to_evaluate : (i + 1) * samples_to_evaluate
+            else:
+                fold_indices = [
+                    range(i * samples_to_evaluate, (i + 1) * samples_to_evaluate)
+                    for i in range(self.cfg.general.num_sample_fold)
                 ]
+
+            for i, idx in enumerate(fold_indices):
+                t0 = time.time()
+                cur_samples = [samples[j] for j in idx]
+                cur_labels = [labels[j] for j in idx]
 
                 cur_to_log = self.sampling_metrics.forward(
                     cur_samples,
@@ -395,6 +412,8 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 with open(filename, "w") as file:
                     for key, value in cur_to_log.items():
                         file.write(f"{key}: {value}\n")
+
+                print(f"[timing] eval fold {i}: {time.time() - t0:.2f}s for {len(cur_samples)} graphs")
 
             to_log = {
                 i: (np.array(to_log[i]).mean(), np.array(to_log[i]).std())
@@ -555,6 +574,9 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             )
 
             # Sample z_s
+            if t_int == 0 and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            fwd_t0 = time.time()
             sampled_s, discrete_sampled_s = self.sample_p_zs_given_zt(
                 t_norm,
                 s_norm,
@@ -563,6 +585,10 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 y,
                 node_mask,
             )
+            if t_int == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                print(f"[timing] one forward pass (batch {batch_size}): {(time.time() - fwd_t0) * 1000:.1f} ms")
 
             X, E, y = sampled_s.X, sampled_s.E, sampled_s.y
 
@@ -862,7 +888,6 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 f"Search type {self.cfg.sample.search} not implemented."
             )
         search_times["total"] = sum(search_times.values())
-        print("Finished searching. Results saved to search_hyperparameters.csv")
 
         self._write_search_summary(search_times)
 
@@ -875,25 +900,24 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             f.write(f"started: {self._search_started_at}\n")
             if cfg.search == "bo":
                 f.write(f"search_bo_sampler: {cfg.search_bo_sampler}\n")
-                f.write(f"search_bo_n_trials: {cfg.search_bo_n_trials}\n")
+                f.write(f"search_n_trials: {cfg.search_n_trials}\n")
                 f.write(
                     f"search_bo_n_startup_trials: {cfg.search_bo_n_startup_trials}\n"
                 )
-                f.write(f"search_bo_seed: {cfg.search_bo_seed}\n")
+                f.write(f"search_seed: {cfg.search_seed}\n")
                 f.write(f"search_bo_objective: {cfg.search_bo_objective}\n")
             elif cfg.search == "random":
-                f.write(f"search_random_n_trials: {cfg.search_random_n_trials}\n")
+                f.write(f"search_n_trials: {cfg.search_n_trials}\n")
                 f.write(f"eta_range: {list(cfg.search_random_eta_range)}\n")
                 f.write(f"omega_range: {list(cfg.search_random_omega_range)}\n")
                 f.write(
                     f"search_random_omega_root: {cfg.search_random_omega_root}\n"
                 )
-                f.write(f"search_random_seed: {cfg.search_random_seed}\n")
+                f.write(f"search_seed: {cfg.search_seed}\n")
             elif cfg.search == "sobol":
                 f.write("sampler: sobol (optuna QMCSampler, scramble=True)\n")
-                f.write(f"n_trials: {cfg.search_bo_n_trials} "
-                        f"(shared with search_bo_n_trials)\n")
-                f.write(f"seed: {cfg.search_bo_seed} (shared with search_bo_seed)\n")
+                f.write(f"search_n_trials: {cfg.search_n_trials}\n")
+                f.write(f"search_seed: {cfg.search_seed}\n")
                 f.write(f"eta_range: {list(cfg.search_random_eta_range)}\n")
                 f.write(f"omega_range: {list(cfg.search_random_omega_range)}\n")
                 f.write(
@@ -941,6 +965,29 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             lines.append("continued_from: (fresh run, not resumed)")
         lines.append(f"executed_trials_this_run: {n_total}")
         return lines
+
+    def _begin_resumable_search(self, resume_df, resume_path, num_step_list, n_trials):
+        """Set up the shared resume state for the ask/tell searches (BO, Sobol).
+
+        Returns (n_prior, n_total, trial_idx): completed trials per num_step, the
+        number of trials still to run this session, and the next global trial_idx.
+        """
+        n_prior = {
+            ns: (0 if resume_df.empty else int((resume_df["num_step"] == ns).sum()))
+            for ns in num_step_list
+        }
+        n_total = sum(max(0, n_trials - n_prior[ns]) for ns in num_step_list)
+        self._prior_trial_time_s = (
+            0.0
+            if resume_df.empty or "time_s" not in resume_df.columns
+            else float(resume_df["time_s"].sum())
+        )
+        self._search_summary_info = self._resume_summary_lines(
+            resume_df, resume_path, n_total
+        )
+        self._write_search_summary()
+        trial_idx = 0 if resume_df.empty else int(resume_df["trial_idx"].max()) + 1
+        return n_prior, n_total, trial_idx
 
     def _search_version_dir(self, search_name):
         base_dir = os.path.abspath(
@@ -1258,7 +1305,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
         eta_low, eta_high = self.cfg.sample.search_random_eta_range
         omega_low, omega_high = self.cfg.sample.search_random_omega_range
-        n_trials = self.cfg.sample.search_random_n_trials
+        n_trials = self.cfg.sample.search_n_trials
 
         version_dir = self._search_version_dir("random")
         checkpoint_path = os.path.join(version_dir, "results.csv")
@@ -1268,7 +1315,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             checkpoint_path, key_cols, dtypes
         )
 
-        rng = random.Random(self.cfg.sample.search_random_seed)
+        rng = random.Random(self.cfg.sample.search_seed)
         n_total = len(num_step_list) * n_trials
 
         search_start = time.time()
@@ -1464,12 +1511,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         if target_names is None:
             plot_builders = {
                 "optimization_history": lambda: viz.plot_optimization_history(study),
-                "param_importances": lambda: viz.plot_param_importances(study),
-                "contour_eta_omega": lambda: viz.plot_contour(
-                    study, params=["eta", "omega"]
-                ),
                 "slice": lambda: viz.plot_slice(study),
-                "parallel_coordinate": lambda: viz.plot_parallel_coordinate(study),
             }
         else:
             plot_builders = {
@@ -1482,16 +1524,6 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 plot_builders[f"optimization_history_{name}"] = (
                     lambda target=target, name=name: viz.plot_optimization_history(
                         study, target=target, target_name=name
-                    )
-                )
-                plot_builders[f"param_importances_{name}"] = (
-                    lambda target=target, name=name: viz.plot_param_importances(
-                        study, target=target, target_name=name
-                    )
-                )
-                plot_builders[f"contour_eta_omega_{name}"] = (
-                    lambda target=target, name=name: viz.plot_contour(
-                        study, params=["eta", "omega"], target=target, target_name=name
                     )
                 )
                 plot_builders[f"slice_{name}"] = (
@@ -1599,7 +1631,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 f"The sampler's state cannot be reconstructed, so the resume would "
                 f"NOT continue the original search. Something the sampler depends on "
                 f"differs from the run being resumed -- check that search_bo_sampler, "
-                f"search_bo_seed, search_bo_n_startup_trials, search_random_eta_range, "
+                f"search_seed, search_bo_n_startup_trials, search_random_eta_range, "
                 f"search_random_omega_range and the optuna version all match it."
             )
 
@@ -1642,7 +1674,6 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         prior = resume_df[resume_df["num_step"] == num_step].sort_values("trial_idx")
         n_distortions = len(distortion_list)
         has_u = "distortion_u" in prior.columns
-        has_omega_raw = "omega_raw" in prior.columns
         for replay_idx, (_, row) in enumerate(prior.iterrows()):
             trial = study.ask(search_space)
             got_u = float(trial.params["distortion_u"])
@@ -1650,13 +1681,11 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 "eta": float(trial.params["eta"]),
                 "omega": float(trial.params["omega"]),
             }
+            # got["omega"] is the raw sampled value (pre power-transform), so it must
+            # be compared against the recorded raw draw, never the transformed omega.
             recorded = {
                 "eta": row["eta"],
-                "omega": (
-                    row["omega_raw"]
-                    if has_omega_raw and not pd.isna(row["omega_raw"])
-                    else row["omega"]
-                ),
+                "omega": row["omega_raw"],
             }
             if has_u and not pd.isna(row["distortion_u"]):
                 got["distortion_u"] = got_u
@@ -1677,11 +1706,10 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-        results_df = pd.DataFrame()
         distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
         eta_low, eta_high = self.cfg.sample.search_random_eta_range
         omega_low, omega_high = self.cfg.sample.search_random_omega_range
-        n_trials = self.cfg.sample.search_bo_n_trials
+        n_trials = self.cfg.sample.search_n_trials
         sampler_name = self.cfg.sample.search_bo_sampler
         n_startup_trials = self.cfg.sample.search_bo_n_startup_trials
 
@@ -1721,35 +1749,16 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             search_label="BO",
             auto_checkpoint_path=checkpoint_path,
         )
-        n_prior = {
-            num_step: (
-                0 if resume_df.empty
-                else int((resume_df["num_step"] == num_step).sum())
-            )
-            for num_step in num_step_list
-        }
-        n_total = sum(max(0, n_trials - n_prior[ns]) for ns in num_step_list)
-
+        n_prior, n_total, trial_idx = self._begin_resumable_search(
+            resume_df, resume_path, num_step_list, n_trials
+        )
         results_df = resume_df.copy()
         best_per_num_step = {}
-
-        self._prior_trial_time_s = (
-            0.0
-            if resume_df.empty or "time_s" not in resume_df.columns
-            else float(resume_df["time_s"].sum())
-        )
-        self._search_summary_info = self._resume_summary_lines(
-            resume_df, resume_path, n_total
-        )
-        self._write_search_summary()
         search_start = time.time()
         executed_idx = 0  # trials actually run this session (drives the ETA)
-        trial_idx = (
-            0 if resume_df.empty else int(resume_df["trial_idx"].max()) + 1
-        )
         for num_step in num_step_list:
             sampler = self._make_bo_sampler(
-                sampler_name, self.cfg.sample.search_bo_seed, n_startup_trials,
+                sampler_name, self.cfg.sample.search_seed, n_startup_trials,
             )
             study = optuna.create_study(
                 **(
@@ -1891,11 +1900,10 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-        results_df = pd.DataFrame()
         distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
         eta_low, eta_high = self.cfg.sample.search_random_eta_range
         omega_low, omega_high = self.cfg.sample.search_random_omega_range
-        n_trials = self.cfg.sample.search_bo_n_trials
+        n_trials = self.cfg.sample.search_n_trials
         objective_col = "average_ratio_mean"
 
         
@@ -1917,37 +1925,17 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             auto_checkpoint_path=checkpoint_path,
         )
 
-        n_prior = {
-            num_step: (
-                0 if resume_df.empty
-                else int((resume_df["num_step"] == num_step).sum())
-            )
-            for num_step in num_step_list
-        }
-        n_total = sum(max(0, n_trials - n_prior[ns]) for ns in num_step_list)
-
-        
+        n_prior, n_total, trial_idx = self._begin_resumable_search(
+            resume_df, resume_path, num_step_list, n_trials
+        )
         results_df = resume_df.copy()
-
-        self._prior_trial_time_s = (
-            0.0
-            if resume_df.empty or "time_s" not in resume_df.columns
-            else float(resume_df["time_s"].sum())
-        )
-        self._search_summary_info = self._resume_summary_lines(
-            resume_df, resume_path, n_total
-        )
-        self._write_search_summary()
 
         search_start = time.time()
         executed_idx = 0  # trials actually run this session (drives the ETA)
-        trial_idx = (
-            0 if resume_df.empty else int(resume_df["trial_idx"].max()) + 1
-        )
         for num_step in num_step_list:
             
             sampler = optuna.samplers.QMCSampler(
-                qmc_type="sobol", scramble=True, seed=self.cfg.sample.search_bo_seed
+                qmc_type="sobol", scramble=True, seed=self.cfg.sample.search_seed
             )
             study = optuna.create_study(direction="minimize", sampler=sampler)
             self._sobol_warmup(study, search_space)
