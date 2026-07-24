@@ -1,6 +1,8 @@
 import time
 import wandb
 import os
+import json
+import random
 
 import numpy as np
 import pickle
@@ -12,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.distributions.categorical import Categorical
-
+from hydra.utils import get_original_cwd
 from models.transformer_model import GraphTransformer
 
 from metrics.train_metrics import TrainLossDiscrete
@@ -796,28 +798,212 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         The num_step_list is tunable based on requirements.
         """
 
-        num_step_list = [5, 10, 50, 100, 1000]
+        num_step_list = [50]
         if self.cfg.dataset.name == "qm9":
             num_step_list = [1, 5, 10, 50, 100, 500]
         if self.cfg.dataset.name in ["guacamol", 'moses', 'zinc']:  # accelerate
             num_step_list = [50]
 
+        search_times = {}
+
+        self._search_started_at = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+        self._search_summary_info = []
+        self._prior_trial_time_s = 0.0
+        self._write_search_summary()
+
         if self.cfg.sample.search == "all":
-            results_df = self.search_distortion(num_step_list)
-            results_df = self.search_stochasticity(num_step_list)
-            results_df = self.search_target_guidance(num_step_list)
+            t0 = time.time()
+            self.search_distortion(num_step_list)
+            search_times["distortion"] = time.time() - t0
+
+            t0 = time.time()
+            self.search_stochasticity(num_step_list)
+            search_times["stochasticity"] = time.time() - t0
+
+            t0 = time.time()
+            self.search_target_guidance(num_step_list)
+            search_times["target_guidance"] = time.time() - t0
         elif self.cfg.sample.search == "distortion":
-            results_df = self.search_distortion(num_step_list)
+            t0 = time.time()
+            self.search_distortion(num_step_list)
+            search_times["distortion"] = time.time() - t0
+
         elif self.cfg.sample.search == "stochasticity":
-            results_df = self.search_stochasticity(num_step_list)
+            t0 = time.time()
+            self.search_stochasticity(num_step_list)
+            search_times["stochasticity"] = time.time() - t0
         elif self.cfg.sample.search == "target_guidance":
-            results_df = self.search_target_guidance(num_step_list)
+            t0 = time.time()
+            self.search_target_guidance(num_step_list)
+            search_times["target_guidance"] = time.time() - t0
+        elif self.cfg.sample.search == "full_grid":
+            t0 = time.time()
+            self.search_full_grid(num_step_list)
+            search_times["full_grid"] = time.time() - t0
+        elif self.cfg.sample.search == "random":
+            t0 = time.time()
+            self.search_random(num_step_list)
+            search_times["random"] = time.time() - t0
+        elif self.cfg.sample.search == "bo":
+            t0 = time.time()
+            self.search_bayesian_optimization(num_step_list)
+            search_times["bo"] = time.time() - t0
+        elif self.cfg.sample.search == "sobol":
+            t0 = time.time()
+            self.search_sobol(num_step_list)
+            search_times["sobol"] = time.time() - t0
+        elif self.cfg.sample.search == "fixed_configs":
+            t0 = time.time()
+            self.search_fixed_configs()
+            search_times["fixed_configs"] = time.time() - t0
+
         else:
             raise NotImplementedError(
                 f"Search type {self.cfg.sample.search} not implemented."
             )
-
+        search_times["total"] = sum(search_times.values())
         print("Finished searching. Results saved to search_hyperparameters.csv")
+
+        self._write_search_summary(search_times)
+
+
+    def _write_search_summary(self, search_times=None):
+        cfg = self.cfg.sample
+        with open("search_summary.txt", "w") as f:
+            f.write(f"search: {cfg.search}\n")
+            f.write(f"status: {'completed' if search_times else 'running'}\n")
+            f.write(f"started: {self._search_started_at}\n")
+            if cfg.search == "bo":
+                f.write(f"search_bo_sampler: {cfg.search_bo_sampler}\n")
+                f.write(f"search_bo_n_trials: {cfg.search_bo_n_trials}\n")
+                f.write(
+                    f"search_bo_n_startup_trials: {cfg.search_bo_n_startup_trials}\n"
+                )
+                f.write(f"search_bo_seed: {cfg.search_bo_seed}\n")
+                f.write(f"search_bo_objective: {cfg.search_bo_objective}\n")
+            elif cfg.search == "random":
+                f.write(f"search_random_n_trials: {cfg.search_random_n_trials}\n")
+                f.write(f"eta_range: {list(cfg.search_random_eta_range)}\n")
+                f.write(f"omega_range: {list(cfg.search_random_omega_range)}\n")
+                f.write(
+                    f"search_random_omega_root: {cfg.search_random_omega_root}\n"
+                )
+                f.write(f"search_random_seed: {cfg.search_random_seed}\n")
+            elif cfg.search == "sobol":
+                f.write("sampler: sobol (optuna QMCSampler, scramble=True)\n")
+                f.write(f"n_trials: {cfg.search_bo_n_trials} "
+                        f"(shared with search_bo_n_trials)\n")
+                f.write(f"seed: {cfg.search_bo_seed} (shared with search_bo_seed)\n")
+                f.write(f"eta_range: {list(cfg.search_random_eta_range)}\n")
+                f.write(f"omega_range: {list(cfg.search_random_omega_range)}\n")
+                f.write(
+                    f"search_random_omega_root: {cfg.search_random_omega_root}\n"
+                )
+            elif cfg.search == "fixed_configs":
+                f.write("sampler: none (explicit config list, no proposals)\n")
+
+            for line in getattr(self, "_search_summary_info", []):
+                f.write(f"{line}\n")
+
+            if search_times:
+                f.write("\nTime this run:\n")
+                for name, t in search_times.items():
+                    f.write(f"{name}: {t:.2f}s ({t / 60:.2f} min)\n")
+
+
+            # resumed run's time duration info
+                prior = getattr(self, "_prior_trial_time_s", 0.0)
+                if prior:
+                    this_run = search_times.get("total", 0.0)
+                    cumulative = prior + this_run
+                    f.write("\nIncluding the phase(s) this run continues from:\n")
+                    f.write(
+                        f"replayed_trial_time: {prior:.2f}s ({prior / 60:.2f} min) "
+                        f"[sum of time_s over the replayed trials; their compute "
+                        f"only, excluding the earlier job's startup]\n"
+                    )
+                    f.write(
+                        f"cumulative_total: {cumulative:.2f}s "
+                        f"({cumulative / 60:.2f} min)\n"
+                    )
+
+    def _resume_summary_lines(self, resume_df, resume_path, n_total):
+        lines = []
+        if resume_path:
+            lines.append(f"continued_from: {resume_path}")
+            lines.append(
+                f"replayed_trials: {len(resume_df)} (ask/tell replayed from CSV, "
+                f"no model inference re-run; every proposal verified against the "
+                f"recorded one, so the sampler state was exactly reconstructed "
+                f"and this continuation is identical to an uninterrupted run)"
+            )
+        else:
+            lines.append("continued_from: (fresh run, not resumed)")
+        lines.append(f"executed_trials_this_run: {n_total}")
+        return lines
+
+    def _search_version_dir(self, search_name):
+        base_dir = os.path.abspath(
+            os.path.join(get_original_cwd(), "..", "outputs", search_name)
+        )
+        os.makedirs(base_dir, exist_ok=True)
+
+        existing_versions = sorted(
+            int(d.split("_")[1])
+            for d in os.listdir(base_dir)
+            if d.startswith("version_") and d.split("_")[1].isdigit()
+        )
+
+        if existing_versions:
+            latest_dir = os.path.join(base_dir, f"version_{existing_versions[-1]}")
+            if not os.path.exists(os.path.join(latest_dir, "DONE")):
+                self._record_hydra_run(latest_dir)
+                return latest_dir
+            next_version = existing_versions[-1] + 1
+        else:
+            next_version = 0
+
+        new_dir = os.path.join(base_dir, f"version_{next_version}")
+        os.makedirs(new_dir, exist_ok=True)
+        self._record_hydra_run(new_dir)
+        return new_dir
+
+
+    def _record_hydra_run(self, version_dir):
+        try:
+            from hydra.core.hydra_config import HydraConfig
+
+            run_dir = os.path.abspath(HydraConfig.get().runtime.output_dir)
+        except Exception:
+            # not in a Hydra context (e.g. a unit test) -- fall back to cwd
+            run_dir = os.getcwd()
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+        with open(os.path.join(version_dir, "hydra_runs.txt"), "a") as f:
+            f.write(f"{stamp}\t{run_dir}\n")
+
+    def _mark_search_done(self, version_dir):
+        open(os.path.join(version_dir, "DONE"), "w").close()
+
+
+    def _load_search_checkpoint(self, csv_path, key_cols, dtypes):
+        if not os.path.exists(csv_path):
+            return pd.DataFrame(), set()
+        existing = pd.read_csv(csv_path)
+        existing = existing.loc[:, ~existing.columns.str.match(r"^Unnamed")]
+        for col, caster in dtypes.items():
+            existing[col] = existing[col].apply(caster)
+        completed = set(existing[key_cols].apply(tuple, axis=1))
+        print(
+            f"Resuming from checkpoint {csv_path}: "
+            f"{len(completed)} combo(s) already completed."
+        )
+        return existing, completed
+
+    def _save_search_checkpoint(self, results_df, csv_path):
+        tmp_path = f"{csv_path}.tmp"
+        results_df.to_csv(tmp_path)
+        os.replace(tmp_path, csv_path)
+
 
     def search_distortion(self, num_step_list):
         """
@@ -834,6 +1020,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 print(
                     f"############# Testing num steps: {num_step}, distortor: {distortor} #############"
                 )
+                config_start = time.time()
                 samples, labels = self.sample(
                     is_test=True,
                     save_samples=self.cfg.general.save_samples,
@@ -842,12 +1029,15 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 res = self.evaluate_samples(
                     samples=samples, labels=labels, is_test=True
                 )
+                config_time = time.time() - config_start
+                print(f"  -> took {config_time:.2f}s")
                 mean_res = {f"{key}_mean": res[key][0] for key in res}
                 std_res = {f"{key}_std": res[key][1] for key in res}
                 mean_res.update(std_res)
                 res_df = pd.DataFrame([mean_res])
                 res_df["num_step"] = num_step
                 res_df["distortor"] = distortor
+                res_df["time_s"] = config_time
                 results_df = pd.concat([results_df, res_df], ignore_index=True)
                 # save at each step as well
                 results_df.to_csv(f"search_distortion.csv")
@@ -876,6 +1066,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 print(
                     f"############# Testing num steps: {num_step}, eta: {eta} #############"
                 )
+                config_start = time.time()
                 samples, labels = self.sample(
                     is_test=True,
                     save_samples=self.cfg.general.save_samples,
@@ -884,12 +1075,15 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 res = self.evaluate_samples(
                     samples=samples, labels=labels, is_test=True
                 )
+                config_time = time.time() - config_start
+                print(f"  -> took {config_time:.2f}s")
                 mean_res = {f"{key}_mean": res[key][0] for key in res}
                 std_res = {f"{key}_std": res[key][1] for key in res}
                 mean_res.update(std_res)
                 res_df = pd.DataFrame([mean_res])
                 res_df["num_step"] = num_step
                 res_df["eta"] = eta
+                res_df["time_s"] = config_time
                 results_df = pd.concat([results_df, res_df], ignore_index=True)
                 # save at each step as well
                 results_df.to_csv(f"search_stochasticity.csv")
@@ -931,6 +1125,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 print(
                     f"############# Testing num steps: {num_step}, omega: {omega} #############"
                 )
+                config_start = time.time()
                 samples, labels = self.sample(
                     is_test=True,
                     save_samples=self.cfg.general.save_samples,
@@ -939,12 +1134,15 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 res = self.evaluate_samples(
                     samples=samples, labels=labels, is_test=True
                 )
+                config_time = time.time() - config_start
+                print(f"  -> took {config_time:.2f}s")
                 mean_res = {f"{key}_mean": res[key][0] for key in res}
                 std_res = {f"{key}_std": res[key][1] for key in res}
                 mean_res.update(std_res)
                 res_df = pd.DataFrame([mean_res])
                 res_df["num_step"] = num_step
                 res_df["omega"] = omega
+                res_df["time_s"] = config_time
                 results_df = pd.concat([results_df, res_df], ignore_index=True)
                 # save at each step as well
                 results_df.to_csv(f"search_target_guidance.csv")
@@ -956,3 +1154,918 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         results_df.reset_index(inplace=True)
         results_df.set_index(["num_step", "omega"], inplace=True)
         results_df.to_csv(f"search_target_guidance.csv")
+
+
+    def search_full_grid(self, num_step_list):
+        distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
+        eta_list = [0.0, 5, 10, 25]
+        omega_list = [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3]
+
+        version_dir = self._search_version_dir("full_grid")
+        checkpoint_path = os.path.join(version_dir, "results.csv")
+        key_cols = ["num_step", "distortor", "eta", "omega"]
+        dtypes = {
+            "num_step": int,
+            "distortor": str,
+            "eta": float,
+            "omega": float,
+        }
+
+        results_df, completed = self._load_search_checkpoint(
+            checkpoint_path, key_cols, dtypes
+        )
+
+        total_runs = (
+            len(num_step_list) * len(distortion_list) * len(eta_list) * len(omega_list)
+        )
+
+        run_idx = 0
+        search_start = time.time()
+
+        for num_step in num_step_list:
+            for distortor in distortion_list:
+                for eta in eta_list:
+                    for omega in omega_list:
+                        run_idx += 1
+                        if (int(num_step), str(distortor), float(eta), float(omega)) in completed:
+                            continue
+                        self.cfg.sample.sample_steps = num_step
+                        self.cfg.sample.time_distortion = distortor
+                        self.cfg.sample.eta = eta
+                        self.rate_matrix_designer.eta = eta
+                        self.cfg.sample.omega = omega
+                        self.rate_matrix_designer.omega = omega
+                        print(
+                            f"############# [{run_idx}/{total_runs}] Testing num steps: {num_step}, "
+                            f"distortor: {distortor}, eta: {eta}, omega: {omega} #############"
+                        )
+                        config_start = time.time()
+                        samples, labels = self.sample(
+                            is_test=True,
+                            save_samples=self.cfg.general.save_samples,
+                            save_visualization=False,
+                        )
+                        res = self.evaluate_samples(
+                            samples=samples, labels=labels, is_test=True
+                        )
+                        config_time = time.time() - config_start
+                        elapsed_total = time.time() - search_start
+                        avg_run_time = elapsed_total / run_idx
+                        eta_remaining = avg_run_time * (total_runs - run_idx)
+                        print(
+                            f"  -> took {config_time:.2f}s | elapsed: {elapsed_total:.2f}s "
+                            f"({elapsed_total / 60:.2f} min) | ETA remaining: "
+                            f"{eta_remaining:.2f}s ({eta_remaining / 60:.2f} min)"
+                        )
+                        mean_res = {f"{key}_mean": res[key][0] for key in res}
+                        std_res = {f"{key}_std": res[key][1] for key in res}
+                        mean_res.update(std_res)
+                        res_df = pd.DataFrame([mean_res])
+                        res_df["num_step"] = num_step
+                        res_df["distortor"] = distortor
+                        res_df["eta"] = eta
+                        res_df["omega"] = omega
+                        res_df["time_s"] = config_time
+                        results_df = pd.concat([results_df, res_df], ignore_index=True)
+                        completed.add((int(num_step), str(distortor), float(eta), float(omega)))
+                        # save at each step as well
+                        self._save_search_checkpoint(results_df, checkpoint_path)
+
+        self.cfg.sample.time_distortion = "identity"
+        self.cfg.sample.eta = 0.0
+        self.rate_matrix_designer.eta = 0.0
+        self.cfg.sample.omega = 0.0
+        self.rate_matrix_designer.omega = 0.0
+
+        results_df.reset_index(inplace=True)
+        results_df.set_index(["num_step", "distortor", "eta", "omega"], inplace=True)
+        self._save_search_checkpoint(results_df, checkpoint_path)
+        self._mark_search_done(version_dir)
+        print(f"search_full_grid results checkpointed at {checkpoint_path}")
+
+
+    def _omega_power_transform(self, omega_linear):
+        
+        omega_low, omega_high = self.cfg.sample.search_random_omega_range
+        span = omega_high - omega_low
+        if span == 0:
+            return omega_low
+        u = (omega_linear - omega_low) / span
+        return omega_low + (1.0 - u ** self.cfg.sample.search_random_omega_root) * span
+
+    def search_random(self, num_step_list):
+
+        distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
+        eta_low, eta_high = self.cfg.sample.search_random_eta_range
+        omega_low, omega_high = self.cfg.sample.search_random_omega_range
+        n_trials = self.cfg.sample.search_random_n_trials
+
+        version_dir = self._search_version_dir("random")
+        checkpoint_path = os.path.join(version_dir, "results.csv")
+        key_cols = ["num_step", "trial_idx"]
+        dtypes = {"num_step": int, "trial_idx": int}
+        results_df, completed = self._load_search_checkpoint(
+            checkpoint_path, key_cols, dtypes
+        )
+
+        rng = random.Random(self.cfg.sample.search_random_seed)
+        n_total = len(num_step_list) * n_trials
+
+        search_start = time.time()
+        global_idx = 0
+        for num_step in num_step_list:
+            for trial_idx in range(n_trials):
+                distortor = rng.choice(distortion_list)
+                eta = rng.uniform(eta_low, eta_high)
+                omega_raw = rng.uniform(omega_low, omega_high)
+                omega = self._omega_power_transform(omega_raw)
+
+                if (int(num_step), int(trial_idx)) in completed:
+                    global_idx += 1
+                    continue
+
+                self.cfg.sample.sample_steps = num_step
+                self.cfg.sample.time_distortion = distortor
+                self.cfg.sample.eta = eta
+                self.rate_matrix_designer.eta = eta
+                self.cfg.sample.omega = omega
+                self.rate_matrix_designer.omega = omega
+
+                print(
+                    f"############# [{global_idx + 1}/{n_total}] Random trial: "
+                    f"num_steps: {num_step}, distortor: {distortor}, "
+                    f"eta: {eta:.4f}, omega: {omega:.4f} #############"
+                )
+                config_start = time.time()
+                samples, labels = self.sample(
+                    is_test=True,
+                    save_samples=self.cfg.general.save_samples,
+                    save_visualization=False,
+                )
+                res = self.evaluate_samples(
+                    samples=samples, labels=labels, is_test=True
+                )
+                config_time = time.time() - config_start
+                elapsed_total = time.time() - search_start
+                avg_run_time = elapsed_total / (global_idx + 1)
+                eta_remaining = avg_run_time * (n_total - global_idx - 1)
+                print(
+                    f"  -> took {config_time:.2f}s | elapsed: {elapsed_total:.2f}s "
+                    f"({elapsed_total / 60:.2f} min) | ETA remaining: "
+                    f"{eta_remaining:.2f}s ({eta_remaining / 60:.2f} min)"
+                )
+                mean_res = {f"{key}_mean": res[key][0] for key in res}
+                std_res = {f"{key}_std": res[key][1] for key in res}
+                mean_res.update(std_res)
+                res_df = pd.DataFrame([mean_res])
+                res_df["num_step"] = num_step
+                res_df["distortor"] = distortor
+                res_df["eta"] = eta
+                # omega is the transformed value DeFoG sampled with; omega_raw is
+                # the uniform draw before the power transform
+                res_df["omega"] = omega
+                res_df["omega_raw"] = omega_raw
+                res_df["trial_idx"] = trial_idx
+                res_df["time_s"] = config_time
+                results_df = pd.concat([results_df, res_df], ignore_index=True)
+                completed.add((int(num_step), int(trial_idx)))
+                self._save_search_checkpoint(results_df, checkpoint_path)
+                global_idx += 1
+
+        self.cfg.sample.time_distortion = "identity"
+        self.cfg.sample.eta = 0.0
+        self.rate_matrix_designer.eta = 0.0
+        self.cfg.sample.omega = 0.0
+        self.rate_matrix_designer.omega = 0.0
+        results_df.reset_index(inplace=True)
+        results_df.set_index(
+            ["num_step", "distortor", "eta", "omega"], inplace=True
+        )
+        self._save_search_checkpoint(results_df, checkpoint_path)
+        self._mark_search_done(version_dir)
+        print(f"search_random results checkpointed at {checkpoint_path}")
+
+
+    def _load_fixed_configs(self):
+        csv_path = self.cfg.sample.search_configs_csv
+        csv_path = os.path.abspath(os.path.join(get_original_cwd(), os.path.expanduser(str(csv_path))))
+
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"sample.search_configs_csv: no such file '{csv_path}'.")
+
+        df = pd.read_csv(csv_path)
+        configs = [
+            {
+                "distortor": str(row["time_distortion"]).strip(),
+                "eta": float(row["eta"]),
+                "omega": float(row["omega"]),
+            }
+            for _, row in df.iterrows()
+        ]
+        return configs, csv_path
+
+    def search_fixed_configs(self):
+        """
+        Evaluate a fixed list of sampling configs read from a CSV.
+        """
+        num_step = 1000
+        configs, csv_path = self._load_fixed_configs()
+        results_df = pd.DataFrame()
+
+        print(
+            f"Evaluating {len(configs)} fixed config(s) at num_steps "
+            f"{num_step} from {csv_path}"
+        )
+
+        for config_idx, config in enumerate(configs):
+            distortor = config["distortor"]
+            eta = config["eta"]
+            omega = config["omega"]
+
+            self.cfg.sample.sample_steps = num_step
+            self.cfg.sample.time_distortion = distortor
+            self.cfg.sample.eta = eta
+            self.rate_matrix_designer.eta = eta
+            self.cfg.sample.omega = omega
+            self.rate_matrix_designer.omega = omega
+
+            print(
+                f"############# Fixed config {config_idx}: "
+                f"num_steps: {num_step}, distortor: {distortor}, "
+                f"eta: {eta:.4f}, omega: {omega:.4f} #############"
+            )
+
+            config_start = time.time()
+            samples, labels = self.sample(
+                is_test=True,
+                save_samples=self.cfg.general.save_samples,
+                save_visualization=False,
+            )
+            res = self.evaluate_samples(
+                samples=samples, labels=labels, is_test=True
+            )
+            config_time = time.time() - config_start
+            print(f"  -> took {config_time:.2f}s")
+            mean_res = {f"{key}_mean": res[key][0] for key in res}
+            std_res = {f"{key}_std": res[key][1] for key in res}
+            mean_res.update(std_res)
+
+            res_df = pd.DataFrame([mean_res])
+            res_df["num_step"] = num_step
+            res_df["distortor"] = distortor
+            res_df["eta"] = eta
+            res_df["omega"] = omega
+            res_df["config_idx"] = config_idx
+            res_df["time_s"] = config_time
+            results_df = pd.concat([results_df, res_df], ignore_index=True)
+            # save at each step as well
+            results_df.to_csv(f"search_fixed_configs.csv")
+
+        # set back to default values
+        self.cfg.sample.time_distortion = "identity"
+        self.cfg.sample.eta = 0.0
+        self.rate_matrix_designer.eta = 0.0
+        self.cfg.sample.omega = 0.0
+        self.rate_matrix_designer.omega = 0.0
+
+        # save the final results
+        results_df.reset_index(inplace=True)
+        results_df.set_index(
+            ["num_step", "distortor", "eta", "omega"], inplace=True
+        )
+        results_df.to_csv(f"search_fixed_configs.csv")
+
+    def _make_bo_sampler(self, sampler_name, seed, n_startup_trials):
+        import optuna
+
+        if sampler_name == "gp":
+            return optuna.samplers.GPSampler(
+                seed=seed, n_startup_trials=n_startup_trials
+            )
+        elif sampler_name == "tpe":
+            return optuna.samplers.TPESampler(
+                seed=seed, n_startup_trials=n_startup_trials
+            )
+        else:
+            raise ValueError(f"Unknown search_bo_sampler '{sampler_name}'. ")
+
+    def _save_optuna_visualizations(self, study, num_step, sampler_name, target_names=None):
+        try:
+            from optuna import visualization as viz
+        except Exception as e:
+            print(f"  [viz] optuna.visualization unavailable, skipping ({e})")
+            return
+        if not viz.is_available():
+            print("  [viz] plotly not installed; skipping Optuna plots "
+                    "(pip install plotly)")
+            return
+        
+        tag = f"{sampler_name}_numstep{num_step}"
+        if target_names is None:
+            plot_builders = {
+                "optimization_history": lambda: viz.plot_optimization_history(study),
+                "param_importances": lambda: viz.plot_param_importances(study),
+                "contour_eta_omega": lambda: viz.plot_contour(
+                    study, params=["eta", "omega"]
+                ),
+                "slice": lambda: viz.plot_slice(study),
+                "parallel_coordinate": lambda: viz.plot_parallel_coordinate(study),
+            }
+        else:
+            plot_builders = {
+                "pareto_front": lambda: viz.plot_pareto_front(
+                    study, target_names=target_names
+                ),
+            }
+            for i, name in enumerate(target_names):
+                target = lambda t, i=i: t.values[i]
+                plot_builders[f"optimization_history_{name}"] = (
+                    lambda target=target, name=name: viz.plot_optimization_history(
+                        study, target=target, target_name=name
+                    )
+                )
+                plot_builders[f"param_importances_{name}"] = (
+                    lambda target=target, name=name: viz.plot_param_importances(
+                        study, target=target, target_name=name
+                    )
+                )
+                plot_builders[f"contour_eta_omega_{name}"] = (
+                    lambda target=target, name=name: viz.plot_contour(
+                        study, params=["eta", "omega"], target=target, target_name=name
+                    )
+                )
+                plot_builders[f"slice_{name}"] = (
+                    lambda target=target, name=name: viz.plot_slice(
+                        study, target=target, target_name=name
+                    )
+                )
+        for name, build in plot_builders.items():
+            try:
+                fig = build()
+            except Exception as e:
+                print(f"  [viz] skip {name} for {tag}: {e}")
+                continue
+            html_path = f"optuna_{tag}_{name}.html"
+            try:
+                fig.write_html(html_path)
+            except Exception as e:
+                print(f"  [viz] could not write {html_path}: {e}")
+            if wandb.run:
+                try:
+                    wandb.log(
+                        {f"optuna/{name}/{tag}": wandb.Plotly(fig)}, commit=True
+                    )
+                except Exception as e:
+                    print(f"  [viz] could not log {name} to wandb: {e}")
+        print(f"  [viz] Optuna plots saved for {tag} (optuna_{tag}_*.html)")
+
+
+    def _load_search_resume_df(
+        self,
+        objective_col,
+        csv_name="search_bayesian_optimization.csv",
+        search_label="bo",
+        drop_missing_objective=True,
+        auto_checkpoint_path=None,
+    ):
+        if isinstance(objective_col, str):
+            objective_col = [objective_col]
+
+        resume_from = self.cfg.sample.search_bo_resume_from
+        if resume_from:
+            csv_path = str(resume_from)
+            if os.path.isdir(csv_path):
+                csv_path = os.path.join(csv_path, csv_name)
+            if not os.path.exists(csv_path):
+                raise FileNotFoundError(
+                    f"search_bo_resume_from: no {search_label} results CSV found "
+                    f"at '{csv_path}'. Resuming a '{search_label}' run needs that "
+                    f"run's {csv_name}."
+                )
+        elif auto_checkpoint_path and os.path.exists(auto_checkpoint_path):
+            csv_path = auto_checkpoint_path
+            print(
+                f"Autoresuming {search_label} search from its checkpoint "
+                f"'{csv_path}'."
+            )
+        else:
+            return pd.DataFrame(), None
+
+        df = pd.read_csv(csv_path)
+        # Drop what to_csv leaves behind: the unnamed index column, plus the bare
+        # 'index' column a *completed* sobol run's reset_index() writes out.
+        df = df.loc[:, ~df.columns.str.match(r"^Unnamed")]
+        df = df.drop(columns=[c for c in ("index",) if c in df.columns])
+
+        required = {"num_step", "distortor", "eta", "omega", "trial_idx", *objective_col}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(
+                f"search_bo_resume_from: '{csv_path}' is missing column(s) "
+                f"{sorted(missing)} needed to replay the study. (Was it run with "
+                f"a different search_bo_objective?)"
+            )
+        if drop_missing_objective:
+            # A trial missing any objective value can't inform the sampler; drop it.
+            df = df.dropna(subset=objective_col).reset_index(drop=True)
+
+        print(
+            f"Resuming {search_label} from {csv_path}: {len(df)} completed trial(s) "
+            f"will be replayed into the study without re-running model inference."
+        )
+        return df, csv_path
+
+
+    def _assert_replay_matches(self, got, recorded, num_step, replay_idx, search_label):
+        mismatched = []
+        for name, got_val in got.items():
+            rec_val = recorded[name]
+            if isinstance(got_val, float):
+                ok = np.isclose(got_val, float(rec_val), rtol=1e-9, atol=1e-12)
+            else:
+                ok = str(got_val) == str(rec_val)
+            if not ok:
+                mismatched.append(name)
+
+        if mismatched:
+            rec_str = ", ".join(f"{k}={recorded[k]!r}" for k in got)
+            got_str = ", ".join(f"{k}={got[k]!r}" for k in got)
+            raise RuntimeError(
+                f"{search_label} resume: replayed trial {replay_idx} "
+                f"(num_step={num_step}) did not reproduce the recorded proposal "
+                f"-- differs in {mismatched}.\n"
+                f"  recorded: {rec_str}\n"
+                f"  replayed: {got_str}\n"
+                f"The sampler's state cannot be reconstructed, so the resume would "
+                f"NOT continue the original search. Something the sampler depends on "
+                f"differs from the run being resumed -- check that search_bo_sampler, "
+                f"search_bo_seed, search_bo_n_startup_trials, search_random_eta_range, "
+                f"search_random_omega_range and the optuna version all match it."
+            )
+
+    def _replay_bo_trials(self, study, resume_df, num_step, search_space, objective_cols):
+        prior = resume_df[resume_df["num_step"] == num_step].sort_values("trial_idx")
+        for replay_idx, (_, row) in enumerate(prior.iterrows()):
+            with torch.inference_mode(False), torch.enable_grad():
+                trial = study.ask(search_space)
+            got = {
+                "eta": float(trial.params["eta"]),
+                "omega": float(trial.params["omega"]),
+                "time_distortion": str(trial.params["time_distortion"]),
+            }
+            recorded = {
+                "eta": row["eta"],
+                "omega": row["omega"],
+                "time_distortion": str(row["distortor"]),
+            }
+            self._assert_replay_matches(got, recorded, num_step, replay_idx, "BO")
+            value = (
+                float(row[objective_cols[0]])
+                if len(objective_cols) == 1
+                else [float(row[c]) for c in objective_cols]
+            )
+            study.tell(trial, value)
+        return len(prior)
+
+
+    def _sobol_warmup(self, study, search_space):
+        import optuna
+
+        warmup_trial = study.ask(search_space)
+        study.tell(warmup_trial, state=optuna.trial.TrialState.PRUNED)
+
+    def _replay_sobol_trials(
+        self, study, resume_df, num_step, search_space, objective_col, distortion_list
+    ):
+        import optuna
+
+        prior = resume_df[resume_df["num_step"] == num_step].sort_values("trial_idx")
+        n_distortions = len(distortion_list)
+        has_u = "distortion_u" in prior.columns
+        has_omega_raw = "omega_raw" in prior.columns
+        for replay_idx, (_, row) in enumerate(prior.iterrows()):
+            trial = study.ask(search_space)
+            got_u = float(trial.params["distortion_u"])
+            got = {
+                "eta": float(trial.params["eta"]),
+                "omega": float(trial.params["omega"]),
+            }
+            recorded = {
+                "eta": row["eta"],
+                "omega": (
+                    row["omega_raw"]
+                    if has_omega_raw and not pd.isna(row["omega_raw"])
+                    else row["omega"]
+                ),
+            }
+            if has_u and not pd.isna(row["distortion_u"]):
+                got["distortion_u"] = got_u
+                recorded["distortion_u"] = row["distortion_u"]
+            else:
+                got["time_distortion"] = distortion_list[min(int(got_u), n_distortions - 1)]
+                recorded["time_distortion"] = str(row["distortor"])
+            self._assert_replay_matches(got, recorded, num_step, replay_idx, "sobol")
+            value = float(row[objective_col])
+            if np.isfinite(value):
+                study.tell(trial, value)
+            else:
+                study.tell(trial, state=optuna.trial.TrialState.FAIL)
+        return len(prior)
+
+    def search_bayesian_optimization(self, num_step_list):
+        import optuna
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        results_df = pd.DataFrame()
+        distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
+        eta_low, eta_high = self.cfg.sample.search_random_eta_range
+        omega_low, omega_high = self.cfg.sample.search_random_omega_range
+        n_trials = self.cfg.sample.search_bo_n_trials
+        sampler_name = self.cfg.sample.search_bo_sampler
+        n_startup_trials = self.cfg.sample.search_bo_n_startup_trials
+
+        objective_specs = {
+            "average_ratio": (["average_ratio_mean"], ["minimize"]),
+            "vun": (["sampling/frac_unic_non_iso_valid_mean"], ["maximize"]),
+            "both": (
+                ["average_ratio_mean", "sampling/frac_unic_non_iso_valid_mean"],
+                ["minimize", "maximize"],
+            ),
+        }
+        objective_choice = self.cfg.sample.search_bo_objective
+        if objective_choice not in objective_specs:
+            raise ValueError(
+                f"Unknown search_bo_objective '{objective_choice}'. "
+                f"Choose from {list(objective_specs)}."
+            )
+        objective_cols, objective_directions = objective_specs[objective_choice]
+        is_multi = len(objective_cols) > 1
+
+        search_space = {
+            "eta": optuna.distributions.FloatDistribution(eta_low, eta_high),
+            "omega": optuna.distributions.FloatDistribution(omega_low, omega_high),
+            "time_distortion": optuna.distributions.CategoricalDistribution(
+                distortion_list
+            ),
+        }
+
+        version_dir = self._search_version_dir("bo")
+        checkpoint_path = os.path.join(
+            version_dir, "search_bayesian_optimization.csv"
+        )
+
+        resume_df, resume_path = self._load_search_resume_df(
+            objective_cols,
+            csv_name="search_bayesian_optimization.csv",
+            search_label="BO",
+            auto_checkpoint_path=checkpoint_path,
+        )
+        n_prior = {
+            num_step: (
+                0 if resume_df.empty
+                else int((resume_df["num_step"] == num_step).sum())
+            )
+            for num_step in num_step_list
+        }
+        n_total = sum(max(0, n_trials - n_prior[ns]) for ns in num_step_list)
+
+        results_df = resume_df.copy()
+        best_per_num_step = {}
+
+        self._prior_trial_time_s = (
+            0.0
+            if resume_df.empty or "time_s" not in resume_df.columns
+            else float(resume_df["time_s"].sum())
+        )
+        self._search_summary_info = self._resume_summary_lines(
+            resume_df, resume_path, n_total
+        )
+        self._write_search_summary()
+        search_start = time.time()
+        executed_idx = 0  # trials actually run this session (drives the ETA)
+        trial_idx = (
+            0 if resume_df.empty else int(resume_df["trial_idx"].max()) + 1
+        )
+        for num_step in num_step_list:
+            sampler = self._make_bo_sampler(
+                sampler_name, self.cfg.sample.search_bo_seed, n_startup_trials,
+            )
+            study = optuna.create_study(
+                **(
+                    {"direction": objective_directions[0]}
+                    if not is_multi
+                    else {"directions": objective_directions}
+                ),
+                sampler=sampler,
+            )
+            n_done = n_prior[num_step]
+            if n_done:
+                self._replay_bo_trials(
+                    study, resume_df, num_step, search_space, objective_cols
+                )
+                print(
+                    f"Replayed {n_done} completed trial(s) for num_step={num_step} "
+                    f"into the {sampler_name} study: every proposal was "
+                    f"regenerated and verified against the recorded one, so the "
+                    f"sampler state is exactly reconstructed and no model "
+                    f"inference was re-run. {max(0, n_trials - n_done)} trial(s) "
+                    f"left to run."
+                )
+
+            for step_trial_idx in range(n_done, n_trials):
+                with torch.inference_mode(False), torch.enable_grad():
+                    trial = study.ask(search_space)
+                eta = float(trial.params["eta"])
+                omega = float(trial.params["omega"])
+                distortor = trial.params["time_distortion"]
+
+                self.cfg.sample.sample_steps = num_step
+                self.cfg.sample.time_distortion = distortor
+                self.cfg.sample.eta = eta
+                self.rate_matrix_designer.eta = eta
+                self.cfg.sample.omega = omega
+                self.rate_matrix_designer.omega = omega
+
+                print(
+                    f"############# [{executed_idx + 1}/{n_total}] BO trial "
+                    f"({sampler_name}): num_steps: {num_step}, distortor: "
+                    f"{distortor}, eta: {eta:.4f}, omega: {omega:.4f} "
+                    f"(trial_idx {trial_idx}) #############"
+                )
+                config_start = time.time()
+                samples, labels = self.sample(
+                    is_test=True,
+                    save_samples=self.cfg.general.save_samples,
+                    save_visualization=False,
+                )
+                res = self.evaluate_samples(
+                    samples=samples, labels=labels, is_test=True
+                )
+                config_time = time.time() - config_start
+                elapsed_total = time.time() - search_start
+
+                avg_run_time = elapsed_total / (executed_idx + 1)
+                eta_remaining = avg_run_time * (n_total - executed_idx - 1)
+                print(
+                    f"  -> took {config_time:.2f}s | elapsed: {elapsed_total:.2f}s "
+                    f"({elapsed_total / 60:.2f} min) | ETA remaining: "
+                    f"{eta_remaining:.2f}s ({eta_remaining / 60:.2f} min)"
+                )
+                mean_res = {f"{key}_mean": res[key][0] for key in res}
+                std_res = {f"{key}_std": res[key][1] for key in res}
+                mean_res.update(std_res)
+
+                value = (
+                    float(mean_res[objective_cols[0]])
+                    if not is_multi
+                    else [float(mean_res[c]) for c in objective_cols]
+                )
+                study.tell(trial, value)
+
+                res_df = pd.DataFrame([mean_res])
+                res_df["num_step"] = num_step
+                res_df["distortor"] = distortor
+                res_df["eta"] = eta
+                res_df["omega"] = omega
+                res_df["pair_idx"] = step_trial_idx
+                res_df["trial_idx"] = trial_idx
+                res_df["time_s"] = config_time
+                results_df = pd.concat([results_df, res_df], ignore_index=True)
+                self._save_search_checkpoint(results_df, checkpoint_path)
+
+                trial_idx += 1
+                executed_idx += 1
+            if self.cfg.sample.search_bo_visualize:
+                self._save_optuna_visualizations(
+                    study, num_step, sampler_name,
+                    target_names=(["average_ratio", "vun"] if is_multi else None),
+                )
+
+            if study.trials:
+                best_per_num_step[num_step] = (
+                    [(t.values, t.params) for t in study.best_trials]
+                    if is_multi
+                    else (study.best_value, study.best_params)
+                )
+
+
+        self.cfg.sample.time_distortion = "identity"
+        self.cfg.sample.eta = 0.0
+        self.rate_matrix_designer.eta = 0.0
+        self.cfg.sample.omega = 0.0
+        self.rate_matrix_designer.omega = 0.0
+
+        info = list(self._search_summary_info)
+        info.append(f"total_trials_after_run: {len(results_df)}")
+        for num_step, entry in best_per_num_step.items():
+            if is_multi:
+                info.append(
+                    f"pareto_front[num_step={num_step}]: {len(entry)} trial(s)"
+                )
+                for values, params in entry:
+                    info.append(
+                        f"  avg_ratio={values[0]:.6f}, vun={values[1]:.6f} at "
+                        f"eta={params['eta']:.4f}, omega={params['omega']:.4f}, "
+                        f"time_distortion={params['time_distortion']}"
+                    )
+            else:
+                best_value, best_params = entry
+                info.append(
+                    f"best[num_step={num_step}]: {objective_choice}={best_value:.6f} "
+                    f"at eta={best_params['eta']:.4f}, omega={best_params['omega']:.4f}, "
+                    f"time_distortion={best_params['time_distortion']}"
+                )
+        self._search_summary_info = info
+
+        results_df.reset_index(inplace=True)
+        results_df.set_index(
+            ["num_step", "distortor", "eta", "omega"], inplace=True
+        )
+        self._save_search_checkpoint(results_df, checkpoint_path)
+        self._mark_search_done(version_dir)
+        print(f"search_bayesian_optimization results checkpointed at {checkpoint_path}")
+
+    def search_sobol(self, num_step_list):
+        import optuna
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        results_df = pd.DataFrame()
+        distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
+        eta_low, eta_high = self.cfg.sample.search_random_eta_range
+        omega_low, omega_high = self.cfg.sample.search_random_omega_range
+        n_trials = self.cfg.sample.search_bo_n_trials
+        objective_col = "average_ratio_mean"
+
+        
+        n_distortions = len(distortion_list)
+        search_space = {
+            "eta": optuna.distributions.FloatDistribution(eta_low, eta_high),
+            "omega": optuna.distributions.FloatDistribution(omega_low, omega_high),
+            "distortion_u": optuna.distributions.FloatDistribution(0, n_distortions),
+        }
+
+        version_dir = self._search_version_dir("sobol")
+        checkpoint_path = os.path.join(version_dir, "search_sobol.csv")
+
+        resume_df, resume_path = self._load_search_resume_df(
+            objective_col,
+            csv_name="search_sobol.csv",
+            search_label="sobol",
+            drop_missing_objective=False,
+            auto_checkpoint_path=checkpoint_path,
+        )
+
+        n_prior = {
+            num_step: (
+                0 if resume_df.empty
+                else int((resume_df["num_step"] == num_step).sum())
+            )
+            for num_step in num_step_list
+        }
+        n_total = sum(max(0, n_trials - n_prior[ns]) for ns in num_step_list)
+
+        
+        results_df = resume_df.copy()
+
+        self._prior_trial_time_s = (
+            0.0
+            if resume_df.empty or "time_s" not in resume_df.columns
+            else float(resume_df["time_s"].sum())
+        )
+        self._search_summary_info = self._resume_summary_lines(
+            resume_df, resume_path, n_total
+        )
+        self._write_search_summary()
+
+        search_start = time.time()
+        executed_idx = 0  # trials actually run this session (drives the ETA)
+        trial_idx = (
+            0 if resume_df.empty else int(resume_df["trial_idx"].max()) + 1
+        )
+        for num_step in num_step_list:
+            
+            sampler = optuna.samplers.QMCSampler(
+                qmc_type="sobol", scramble=True, seed=self.cfg.sample.search_bo_seed
+            )
+            study = optuna.create_study(direction="minimize", sampler=sampler)
+            self._sobol_warmup(study, search_space)
+
+            n_done = n_prior[num_step]
+            if n_done:
+                self._replay_sobol_trials(
+                    study, resume_df, num_step, search_space, objective_col,
+                    distortion_list,
+                )
+                print(
+                    f"Replayed {n_done} completed trial(s) for num_step={num_step} "
+                    f"into the sobol study: every point was regenerated and "
+                    f"verified against the recorded one, so the sequence resumes "
+                    f"at index {n_done} and no model inference was re-run. "
+                    f"{max(0, n_trials - n_done)} trial(s) left to run."
+                )
+
+            for step_trial_idx in range(n_done, n_trials):
+                trial = study.ask(search_space)
+                eta = float(trial.params["eta"])
+                omega_raw = float(trial.params["omega"])
+                omega = self._omega_power_transform(omega_raw)
+                
+                distortor = distortion_list[
+                    min(int(trial.params["distortion_u"]), n_distortions - 1)
+                ]
+                
+                trial.set_user_attr("time_distortion", distortor)
+
+                self.cfg.sample.sample_steps = num_step
+                self.cfg.sample.time_distortion = distortor
+                self.cfg.sample.eta = eta
+                self.rate_matrix_designer.eta = eta
+                self.cfg.sample.omega = omega
+                self.rate_matrix_designer.omega = omega
+                print(
+                    f"############# [{executed_idx + 1}/{n_total}] Sobol trial: "
+                    f"num_steps: {num_step}, distortor: {distortor}, "
+                    f"eta: {eta:.4f}, omega: {omega:.4f} "
+                    f"(trial_idx {trial_idx}) #############"
+                )
+                config_start = time.time()
+                samples, labels = self.sample(
+                    is_test=True,
+                    save_samples=self.cfg.general.save_samples,
+                    save_visualization=False,
+                )
+                res = self.evaluate_samples(
+                    samples=samples, labels=labels, is_test=True
+                )
+                config_time = time.time() - config_start
+                elapsed_total = time.time() - search_start
+                
+                avg_run_time = elapsed_total / (executed_idx + 1)
+                eta_remaining = avg_run_time * (n_total - executed_idx - 1)
+                print(
+                    f"  -> took {config_time:.2f}s | elapsed: {elapsed_total:.2f}s "
+                    f"({elapsed_total / 60:.2f} min) | ETA remaining: "
+                    f"{eta_remaining:.2f}s ({eta_remaining / 60:.2f} min)"
+                )
+                mean_res = {f"{key}_mean": res[key][0] for key in res}
+                std_res = {f"{key}_std": res[key][1] for key in res}
+                mean_res.update(std_res)
+
+                
+                study.tell(trial, float(mean_res[objective_col]))
+
+                if wandb.run:
+                    wandb.log(
+                        {
+                            **mean_res,
+                            "num_step": num_step,
+                            "distortor": distortor,
+                            "eta": eta,
+                            "omega": omega,
+                            "pair_idx": step_trial_idx,
+                            "trial_idx": trial_idx,
+                            "time_s": config_time,
+                        },
+                        commit=True,
+                    )
+                res_df = pd.DataFrame([mean_res])
+                res_df["num_step"] = num_step
+                res_df["distortor"] = distortor
+                res_df["distortion_u"] = float(trial.params["distortion_u"])
+                res_df["eta"] = eta
+                res_df["omega"] = omega
+                res_df["omega_raw"] = omega_raw
+                res_df["pair_idx"] = step_trial_idx
+                res_df["trial_idx"] = trial_idx
+                res_df["time_s"] = config_time
+                results_df = pd.concat([results_df, res_df], ignore_index=True)
+                self._save_search_checkpoint(results_df, checkpoint_path)
+
+                trial_idx += 1
+                executed_idx += 1
+
+            if self.cfg.sample.search_bo_visualize:
+                self._save_optuna_visualizations(study, num_step, "sobol")
+
+        # set back to default values
+        self.cfg.sample.time_distortion = "identity"
+        self.cfg.sample.eta = 0.0
+        self.rate_matrix_designer.eta = 0.0
+        self.cfg.sample.omega = 0.0
+        self.rate_matrix_designer.omega = 0.0
+
+        # Round out the summary lines published before the search started.
+        info = list(self._search_summary_info)
+        info.append(f"total_trials_after_run: {len(results_df)}")
+        self._search_summary_info = info
+
+        # save the final results
+        results_df.reset_index(inplace=True)
+        results_df.set_index(
+            ["num_step", "distortor", "eta", "omega"], inplace=True
+        )
+        self._save_search_checkpoint(results_df, checkpoint_path)
+        self._mark_search_done(version_dir)
+        print(f"search_sobol results checkpointed at {checkpoint_path}")
