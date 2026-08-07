@@ -374,8 +374,10 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 num_bootstrap_fold = 5
                 n_total = len(samples)
                 holdout = n_total // num_bootstrap_fold
+                n_samples_to_evaluate = 40
+             
                 fold_indices = [
-                    np.random.choice(n_total, size=n_total - holdout, replace=False)
+                    np.random.choice(n_total, size=n_samples_to_evaluate, replace=False)
                     for _ in range(num_bootstrap_fold)
                 ]
             else:
@@ -385,10 +387,10 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 ]
 
             for i, idx in enumerate(fold_indices):
-                t0 = time.time()
                 cur_samples = [samples[j] for j in idx]
                 cur_labels = [labels[j] for j in idx]
 
+                t0 = time.time()
                 cur_to_log = self.sampling_metrics.forward(
                     cur_samples,
                     ref_metrics=self.dataset_info.ref_metrics,
@@ -989,31 +991,71 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         trial_idx = 0 if resume_df.empty else int(resume_df["trial_idx"].max()) + 1
         return n_prior, n_total, trial_idx
 
-    def _search_version_dir(self, search_name):
+    @staticmethod
+    def _slugify(value):
+        """Make a config value safe for a directory name."""
+        text = str(value).strip().lower()
+        return "".join(c if (c.isalnum() or c in "-_.") else "-" for c in text)
+
+    def _search_variant_name(self, search_name, tags):
+        """
+        Directory name for one *variant* of a search.
+
+        Everything that changes which configs get proposed -- dataset, sampler,
+        objective, seed -- has to be part of the name. Two runs that share a
+        directory share the resume CSV, so a run whose proposals differ would
+        otherwise be replayed as if it were the same search.
+        """
+        parts = [search_name] + [
+            self._slugify(t) for t in tags if t is not None and str(t) != ""
+        ]
+        return "_".join(parts)
+
+    def _search_version_dir(self, search_name, tags=()):
         base_dir = os.path.abspath(
-            os.path.join(get_original_cwd(), "..", "outputs", search_name)
+            os.path.join(
+                get_original_cwd(),
+                "..",
+                "outputs",
+                self._search_variant_name(search_name, tags),
+            )
         )
         os.makedirs(base_dir, exist_ok=True)
 
-        existing_versions = sorted(
-            int(d.split("_")[1])
-            for d in os.listdir(base_dir)
-            if d.startswith("version_") and d.split("_")[1].isdigit()
+        # Claiming a version has to be atomic: two jobs starting together would
+        # otherwise both compute the same next_version and share it.
+        for _ in range(100):
+            existing_versions = sorted(
+                int(d.split("_")[1])
+                for d in os.listdir(base_dir)
+                if d.startswith("version_") and d.split("_")[1].isdigit()
+            )
+
+            if existing_versions:
+                latest_dir = os.path.join(base_dir, f"version_{existing_versions[-1]}")
+                if not os.path.exists(os.path.join(latest_dir, "DONE")):
+                    print(f"Resuming search in {latest_dir}")
+                    self._record_hydra_run(latest_dir)
+                    return latest_dir
+                next_version = existing_versions[-1] + 1
+            else:
+                next_version = 0
+
+            new_dir = os.path.join(base_dir, f"version_{next_version}")
+            try:
+                os.mkdir(new_dir)
+            except FileExistsError:
+                # another job claimed this version between the listing and the
+                # mkdir -- rescan and try again
+                continue
+            print(f"Starting search in {new_dir}")
+            self._record_hydra_run(new_dir)
+            return new_dir
+
+        raise RuntimeError(
+            f"Could not claim a version directory under {base_dir} after 100 "
+            f"attempts -- too many jobs starting at once?"
         )
-
-        if existing_versions:
-            latest_dir = os.path.join(base_dir, f"version_{existing_versions[-1]}")
-            if not os.path.exists(os.path.join(latest_dir, "DONE")):
-                self._record_hydra_run(latest_dir)
-                return latest_dir
-            next_version = existing_versions[-1] + 1
-        else:
-            next_version = 0
-
-        new_dir = os.path.join(base_dir, f"version_{next_version}")
-        os.makedirs(new_dir, exist_ok=True)
-        self._record_hydra_run(new_dir)
-        return new_dir
 
 
     def _record_hydra_run(self, version_dir):
@@ -1137,6 +1179,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         # set back to default value
         self.cfg.sample.eta = 0.0
+        self.rate_matrix_designer.eta = 0.0
 
         # save the final results
         results_df.reset_index(inplace=True)
@@ -1196,6 +1239,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         # set back to default value
         self.cfg.sample.omega = 0.0
+        self.rate_matrix_designer.omega = 0.0
 
         # save the final results
         results_df.reset_index(inplace=True)
@@ -1205,10 +1249,13 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
     def search_full_grid(self, num_step_list):
         distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
-        eta_list = [0.0, 5, 10, 25]
-        omega_list = [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3]
+        eta_list = [0.0, 5, 10, 25, 50, 100]
+        omega_list = [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
 
-        version_dir = self._search_version_dir("full_grid")
+        version_dir = self._search_version_dir(
+            "full_grid", tags=(self.cfg.dataset.name,)
+        )
+        self._probe_set_dir(version_dir)
         checkpoint_path = os.path.join(version_dir, "results.csv")
         key_cols = ["num_step", "distortor", "eta", "omega"]
         dtypes = {
@@ -1307,7 +1354,11 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         omega_low, omega_high = self.cfg.sample.search_random_omega_range
         n_trials = self.cfg.sample.search_n_trials
 
-        version_dir = self._search_version_dir("random")
+        version_dir = self._search_version_dir(
+            "random",
+            tags=(self.cfg.dataset.name, f"seed{self.cfg.sample.search_seed}"),
+        )
+        self._probe_set_dir(version_dir)
         checkpoint_path = os.path.join(version_dir, "results.csv")
         key_cols = ["num_step", "trial_idx"]
         dtypes = {"num_step": int, "trial_idx": int}
@@ -1482,7 +1533,9 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         )
         results_df.to_csv(f"search_fixed_configs.csv")
 
-    def _make_bo_sampler(self, sampler_name, seed, n_startup_trials):
+    def _make_bo_sampler(
+        self, sampler_name, seed, n_startup_trials, search_space=None, num_obj=1
+    ):
         import optuna
 
         if sampler_name == "gp":
@@ -1492,6 +1545,19 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         elif sampler_name == "tpe":
             return optuna.samplers.TPESampler(
                 seed=seed, n_startup_trials=n_startup_trials
+            )
+        elif sampler_name == "hebo":
+            try:
+                import optunahub
+            except ImportError as e:
+                raise ImportError(
+                    "search_bo_sampler='hebo' requires the 'optunahub' and "
+                    "'hebo' packages (pip install optunahub hebo pymoo; see "
+                    "https://hub.optuna.org/samplers/hebo/). "
+                ) from e
+            hebo_module = optunahub.load_module("samplers/hebo")
+            return hebo_module.HEBOSampler(
+                search_space=search_space, seed=seed, num_obj=num_obj
             )
         else:
             raise ValueError(f"Unknown search_bo_sampler '{sampler_name}'. ")
@@ -1738,7 +1804,16 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             ),
         }
 
-        version_dir = self._search_version_dir("bo")
+        version_dir = self._search_version_dir(
+            "bo",
+            tags=(
+                self.cfg.dataset.name,
+                sampler_name,
+                objective_choice,
+                f"seed{self.cfg.sample.search_seed}",
+            ),
+        )
+        self._probe_set_dir(version_dir)
         checkpoint_path = os.path.join(
             version_dir, "search_bayesian_optimization.csv"
         )
@@ -1759,6 +1834,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         for num_step in num_step_list:
             sampler = self._make_bo_sampler(
                 sampler_name, self.cfg.sample.search_seed, n_startup_trials,
+                search_space=search_space, num_obj=len(objective_cols),
             )
             study = optuna.create_study(
                 **(
@@ -1914,7 +1990,11 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             "distortion_u": optuna.distributions.FloatDistribution(0, n_distortions),
         }
 
-        version_dir = self._search_version_dir("sobol")
+        version_dir = self._search_version_dir(
+            "sobol",
+            tags=(self.cfg.dataset.name, f"seed{self.cfg.sample.search_seed}"),
+        )
+        self._probe_set_dir(version_dir)
         checkpoint_path = os.path.join(version_dir, "search_sobol.csv")
 
         resume_df, resume_path = self._load_search_resume_df(

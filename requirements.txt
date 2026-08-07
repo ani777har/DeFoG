@@ -16,3 +16,12 @@ torchmetrics==0.11.4
 tqdm==4.65.0
 wandb==0.15.4
 seaborn
+
+# --- sample.search hyperparameter search (search: 'bo' | 'sobol' | 'full_grid') ---
+# optuna backs 'bo' ('gp'/'tpe'/'hebo' samplers) and 'sobol'.
+optuna>=3.6
+# hebo sampler only (search_bo_sampler: hebo). Loaded on demand via
+# optunahub.load_module("samplers/hebo"); see https://hub.optuna.org/samplers/hebo/
+optunahub
+HEBO==0.3.6
+pymoo
