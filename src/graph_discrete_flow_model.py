@@ -24,6 +24,7 @@ from flow_matching.time_distorter import TimeDistorter, find_decoding_error_curv
 from flow_matching.rate_matrix import RateMatrixDesigner
 from flow_matching.utils import p_xt_g_x1
 from flow_matching import flow_matching_utils
+from analysis.trajectory_probes import TrajectoryProbe
 
 
 class GraphDiscreteFlowModel(pl.LightningModule):
@@ -123,6 +124,18 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 cfg.sample, "derived_distortion_signal", "soft_combined"
             ),
         )
+
+        # per-step structural probes over the sampling trajectory (Phase 2).
+        # Disabled by default: costs nothing when cfg.sample.probe_trajectory is
+        # False, since sample_p_zs_given_zt only checks for None.
+        self.trajectory_probe = None
+        if getattr(cfg.sample, "probe_trajectory", False):
+            self.trajectory_probe = TrajectoryProbe(
+                dataset_name=cfg.dataset.name,
+                spectral=getattr(cfg.sample, "probe_spectral", True),
+                validity_every=getattr(cfg.sample, "probe_validity_every", 0),
+                validity_max_graphs=getattr(cfg.sample, "probe_validity_max_graphs", 8),
+            )
 
         # rate matrix designer
         self.rate_matrix_designer = RateMatrixDesigner(
@@ -580,6 +593,11 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             chain_E[0] = sampled_initial.E[:keep_chain]
             chain_times[0] = torch.zeros((keep_chain))
 
+        if self.trajectory_probe is not None:
+            self.trajectory_probe.begin_batch(
+                batch_id, self.cfg.sample.sample_steps
+            )
+
         for t_int in tqdm(range(0, self.cfg.sample.sample_steps)):
             # this state
             t_array = t_int * torch.ones((batch_size, 1)).type_as(y)
@@ -755,6 +773,18 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         G_1_pred = pred_X, pred_E
         G_t = X_t, E_t
+
+        # Probe before the conditional branch below overwrites pred_X/pred_E.
+        if self.trajectory_probe is not None:
+            self.trajectory_probe.record(
+                X_t=X_t,
+                E_t=E_t,
+                pred_X=pred_X,
+                pred_E=pred_E,
+                node_mask=node_mask,
+                t=t,
+                extra_y=getattr(extra_data, "y", None),
+            )
 
         R_t_X, R_t_E = self.rate_matrix_designer.compute_graph_rate_matrix(
             t,
@@ -1566,9 +1596,12 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         """
         Evaluate a fixed list of sampling configs read from a CSV.
         """
-        num_step = 1000
+        num_step = 50
         configs, csv_path = self._load_fixed_configs()
         results_df = pd.DataFrame()
+
+        # writes in the hydra run directory
+        self._probe_set_dir(os.getcwd())
 
         print(
             f"Evaluating {len(configs)} fixed config(s) at num_steps "
