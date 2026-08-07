@@ -3,17 +3,41 @@ eta: 0.
 omega: 0.
 
 # generation settings
-sample_steps: 1000
-time_distortion: "identity"     # 'identity', 'cosine', polyinc, polydec
+sample_steps: 50
+time_distortion: "identity"     # 'identity', 'cosine', polyinc, polydec, derived
+
+# 'derived' time distortion
+derived_distortion_curve: null
+derived_distortion_signal: soft_combined  # column of decoding_error.csv to build tau from
+                                          # ('soft_combined' | 'pe_combined' | 'ce_combined';
+                                          #  pe_* saturates at 2 edge classes -- it is exactly
+                                          #  flat below t~0.33 on planar, so tau is not invertible there)
 search: False           # 'all' | 'target_guidance' | 'distortion' | 'stochasticity' | 'full_grid' | 'random' | 'bo' | 'sobol' | 'fixed_configs' | False
 
 
 
 search_configs_csv: null  # CSV of fixed sampling configs (time_distortion, eta, omega) for search: 'fixed_configs'
 
+# --- decoding error curve P_e(t) ---------------------------------------------
+
+measure_decoding_error: False
+decoding_error_n_times: 51      # grid points on [0,1]; these are probes, not steps
+decoding_error_n_draws: 8       # independent corruptions per graph per t
+decoding_error_coupled: True    # reuse one noise draw across the whole t grid
+                                # (nested reveals -> far less jitter in the curve)
+decoding_error_split: val       # val | test | train -- keep off test
+decoding_error_max_graphs: null # cap the number of graphs; null uses the split
+decoding_error_seed: 0
+
+# --- trajectory probes (Phase 2) ---------------------------------------------
+probe_trajectory: False
+probe_spectral: True          # largest/smallest adjacency eigenvalue (one eigvalsh per step)
+probe_validity_every: 0       # >0: every k steps, run the dataset validity check on argmax(pred_E)
+probe_validity_max_graphs: 8  # graphs per batch to check (CPU-side, keep small)
+
 # shared across the 'random', 'bo' and 'sobol' searches
 search_n_trials: 140   # total trials per num_step
-search_seed: 42
+search_seed: 21 # anishok defaulty 42 er
 
 search_random_eta_range: [0.0, 100.0]
 search_random_omega_range: [0.0, 0.5]

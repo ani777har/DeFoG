@@ -20,7 +20,7 @@ from models.transformer_model import GraphTransformer
 from metrics.train_metrics import TrainLossDiscrete
 from src import utils
 from flow_matching.noise_distribution import NoiseDistribution
-from flow_matching.time_distorter import TimeDistorter
+from flow_matching.time_distorter import TimeDistorter, find_decoding_error_curve
 from flow_matching.rate_matrix import RateMatrixDesigner
 from flow_matching.utils import p_xt_g_x1
 from flow_matching import flow_matching_utils
@@ -101,11 +101,27 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         self.adapt_counter = 0
 
         # time distortor for both training and sampling steps
+        derived_curve = getattr(cfg.sample, "derived_distortion_curve", None)
+        if derived_curve is None:
+            # only auto-discover when 'derived' is actually asked for, so a
+            # stale curve on disk can never silently change another run
+            wants_derived = "derived" in (
+                str(cfg.sample.time_distortion),
+                str(cfg.train.time_distortion),
+            ) or bool(cfg.sample.search)
+            if wants_derived:
+                derived_curve = find_decoding_error_curve(
+                    cfg.dataset.name, root=os.path.join(get_original_cwd(), "..")
+                )
         self.time_distorter = TimeDistorter(
             train_distortion=cfg.train.time_distortion,
             sample_distortion=cfg.sample.time_distortion,
             alpha=1,
             beta=1,
+            derived_curve_path=derived_curve,
+            derived_signal=getattr(
+                cfg.sample, "derived_distortion_signal", "soft_combined"
+            ),
         )
 
         # rate matrix designer
@@ -239,17 +255,28 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
     def on_test_epoch_end(self) -> None:
 
-        if self.cfg.sample.search:
+        if getattr(self.cfg.sample, "measure_decoding_error", False):
+            print("Measuring the decoding error curve P_e(t)...")
+            self.measure_decoding_error_curve()
+        elif self.cfg.sample.search:
             print("Starting sampling optimization...")
             self.search_hyperparameters()
         else:
             print("Starting to sample")
+            # Clean generation timing: sync the GPU on both sides so async CUDA
+            # work is not misattributed to whatever runs next. NOTE: set
+            # general.save_samples=False to keep the (O(n^2) per graph, so
+            # dataset-dependent) sample-to-disk writing out of this measurement.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             t0 = time.time()
             samples, labels = self.sample(
                 is_test=True,
                 save_samples=self.cfg.general.save_samples,
-                save_visualization=False, # anishok
+                save_visualization=False, # anishok True er
             )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             print(f"[timing] generation: {time.time() - t0:.2f}s for {len(samples)} graphs")
             to_log = self.evaluate_samples(samples=samples, labels=labels, is_test=True)
 
@@ -820,6 +847,57 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         return utils.PlaceHolder(X=extra_X, E=extra_E, y=extra_y)
 
+    def measure_decoding_error_curve(self):
+        """Measure P_e(t), the decoding error rate of this checkpoint.
+
+        Stage 1 of deriving a time schedule from the data instead of picking
+        one of the five hand-drawn distortions. Nothing is generated here: real
+        graphs are corrupted to a grid of noise levels and reconstructed in one
+        forward pass each, so the output is a property of the denoiser and the
+        dataset, computed once and cached.
+
+        Runs off the *validation* split by default -- the test split is what
+        the sampling metrics are scored against, and a schedule fitted on it
+        would be tuned on the evaluation set.
+        """
+        from analysis import decoding_error
+
+        cfg_s = self.cfg.sample
+        split = getattr(cfg_s, "decoding_error_split", "val")
+        if split == "val":
+            dataloader = self.trainer.datamodule.val_dataloader()
+        elif split == "test":
+            dataloader = self.trainer.datamodule.test_dataloader()
+        elif split == "train":
+            dataloader = self.trainer.datamodule.train_dataloader()
+        else:
+            raise ValueError(f"Unknown decoding_error_split: {split}")
+
+        out_dir = self._search_version_dir(
+            "decoding_error", tags=(self.cfg.dataset.name,)
+        )
+
+        was_training = self.training
+        self.eval()
+        try:
+            decoding_error.run_and_save(
+                self,
+                dataloader,
+                out_dir=out_dir,
+                n_times=getattr(cfg_s, "decoding_error_n_times", 51),
+                n_draws=getattr(cfg_s, "decoding_error_n_draws", 8),
+                coupled=getattr(cfg_s, "decoding_error_coupled", True),
+                max_graphs=getattr(cfg_s, "decoding_error_max_graphs", None),
+                seed=getattr(cfg_s, "decoding_error_seed", 0),
+                lambda_E=float(self.cfg.model.lambda_train[0]),
+            )
+        finally:
+            if was_training:
+                self.train()
+
+        with open(os.path.join(out_dir, "DONE"), "w") as f:
+            f.write("decoding error curve measured\n")
+
     def search_hyperparameters(self):
         """
         Grid search for sampling hypeparameters.
@@ -1073,6 +1151,64 @@ class GraphDiscreteFlowModel(pl.LightningModule):
     def _mark_search_done(self, version_dir):
         open(os.path.join(version_dir, "DONE"), "w").close()
 
+    # ------------------------------------------------------------ probe hooks
+
+    def _probe_set_dir(self, version_dir):
+        if self.trajectory_probe is not None:
+            self.trajectory_probe.set_output_dir(version_dir)
+            print(
+                f"[trajectory_probe] logging to "
+                f"{self.trajectory_probe.csv_path}"
+            )
+
+    def _sample_and_evaluate(self):
+        """Generate and evaluate one sampling configuration.
+
+        Generation and evaluation are timed separately: truncating the
+        trajectory early only saves the former, so this split is what decides
+        whether early stopping is worth anything on a given dataset. On planar
+        generation dominates; on SBM the 5-fold bootstrap evaluation does.
+
+        Returns (samples, labels, res, config_time); the two halves are left on
+        self._last_sample_time / self._last_eval_time for the caller to log.
+        """
+        if self.trajectory_probe is not None:
+            self.trajectory_probe.begin_trial(
+                num_step=self.cfg.sample.sample_steps,
+                distortor=self.cfg.sample.time_distortion,
+                eta=float(self.cfg.sample.eta),
+                omega=float(self.cfg.sample.omega),
+            )
+
+        t0 = time.time()
+        samples, labels = self.sample(
+            is_test=True,
+            save_samples=self.cfg.general.save_samples,
+            save_visualization=False,
+        )
+        sample_time = time.time() - t0
+
+        if self.trajectory_probe is not None:
+            self.trajectory_probe.end_trial()
+
+        t1 = time.time()
+        res = self.evaluate_samples(samples=samples, labels=labels, is_test=True)
+        eval_time = time.time() - t1
+
+        # Injected as (mean, std) pairs so the existing
+        #   mean_res = {f"{key}_mean": res[key][0] for key in res}
+        # in every search picks them up as columns without further changes.
+        res["sampling_time_s"] = (sample_time, 0.0)
+        res["eval_time_s"] = (eval_time, 0.0)
+
+        self._last_sample_time = sample_time
+        self._last_eval_time = eval_time
+        print(
+            f"  -> generation {sample_time:.2f}s | evaluation {eval_time:.2f}s "
+            f"(eval/gen = {eval_time / max(sample_time, 1e-9):.2f})"
+        )
+        return samples, labels, res, sample_time + eval_time
+
 
     def _load_search_checkpoint(self, csv_path, key_cols, dtypes):
         if not os.path.exists(csv_path):
@@ -1101,6 +1237,10 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         results_df = pd.DataFrame()
         distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
         # distortion_list = ["identity", "polydec"]
+        if self.time_distorter.has_derived():
+            # the data-derived schedule, benchmarked head to head against the
+            # hand-drawn ones under the identical protocol
+            distortion_list.append("derived")
 
         for num_step in num_step_list:
             for distortor in distortion_list:
@@ -1109,16 +1249,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 print(
                     f"############# Testing num steps: {num_step}, distortor: {distortor} #############"
                 )
-                config_start = time.time()
-                samples, labels = self.sample(
-                    is_test=True,
-                    save_samples=self.cfg.general.save_samples,
-                    save_visualization=False,
-                )
-                res = self.evaluate_samples(
-                    samples=samples, labels=labels, is_test=True
-                )
-                config_time = time.time() - config_start
+                samples, labels, res, config_time = self._sample_and_evaluate()
                 print(f"  -> took {config_time:.2f}s")
                 mean_res = {f"{key}_mean": res[key][0] for key in res}
                 std_res = {f"{key}_std": res[key][1] for key in res}
@@ -1155,16 +1286,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 print(
                     f"############# Testing num steps: {num_step}, eta: {eta} #############"
                 )
-                config_start = time.time()
-                samples, labels = self.sample(
-                    is_test=True,
-                    save_samples=self.cfg.general.save_samples,
-                    save_visualization=False,
-                )
-                res = self.evaluate_samples(
-                    samples=samples, labels=labels, is_test=True
-                )
-                config_time = time.time() - config_start
+                samples, labels, res, config_time = self._sample_and_evaluate()
                 print(f"  -> took {config_time:.2f}s")
                 mean_res = {f"{key}_mean": res[key][0] for key in res}
                 std_res = {f"{key}_std": res[key][1] for key in res}
@@ -1215,16 +1337,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 print(
                     f"############# Testing num steps: {num_step}, omega: {omega} #############"
                 )
-                config_start = time.time()
-                samples, labels = self.sample(
-                    is_test=True,
-                    save_samples=self.cfg.general.save_samples,
-                    save_visualization=False,
-                )
-                res = self.evaluate_samples(
-                    samples=samples, labels=labels, is_test=True
-                )
-                config_time = time.time() - config_start
+                samples, labels, res, config_time = self._sample_and_evaluate()
                 print(f"  -> took {config_time:.2f}s")
                 mean_res = {f"{key}_mean": res[key][0] for key in res}
                 std_res = {f"{key}_std": res[key][1] for key in res}
@@ -1293,16 +1406,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                             f"############# [{run_idx}/{total_runs}] Testing num steps: {num_step}, "
                             f"distortor: {distortor}, eta: {eta}, omega: {omega} #############"
                         )
-                        config_start = time.time()
-                        samples, labels = self.sample(
-                            is_test=True,
-                            save_samples=self.cfg.general.save_samples,
-                            save_visualization=False,
-                        )
-                        res = self.evaluate_samples(
-                            samples=samples, labels=labels, is_test=True
-                        )
-                        config_time = time.time() - config_start
+                        samples, labels, res, config_time = self._sample_and_evaluate()
                         elapsed_total = time.time() - search_start
                         avg_run_time = elapsed_total / run_idx
                         eta_remaining = avg_run_time * (total_runs - run_idx)
@@ -1339,13 +1443,18 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
 
     def _omega_power_transform(self, omega_linear):
-        
+
         omega_low, omega_high = self.cfg.sample.search_random_omega_range
         span = omega_high - omega_low
         if span == 0:
             return omega_low
+        root = self.cfg.sample.search_random_omega_root
+        if root == 1.0:
+            # Uniform omega: the power map degenerates to the mirror u -> 1-u,
+            # so pass the draw through untouched and keep omega == omega_raw.
+            return omega_linear
         u = (omega_linear - omega_low) / span
-        return omega_low + (1.0 - u ** self.cfg.sample.search_random_omega_root) * span
+        return omega_low + (1.0 - u ** root) * span
 
     def search_random(self, num_step_list):
 
@@ -1394,16 +1503,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                     f"num_steps: {num_step}, distortor: {distortor}, "
                     f"eta: {eta:.4f}, omega: {omega:.4f} #############"
                 )
-                config_start = time.time()
-                samples, labels = self.sample(
-                    is_test=True,
-                    save_samples=self.cfg.general.save_samples,
-                    save_visualization=False,
-                )
-                res = self.evaluate_samples(
-                    samples=samples, labels=labels, is_test=True
-                )
-                config_time = time.time() - config_start
+                samples, labels, res, config_time = self._sample_and_evaluate()
                 elapsed_total = time.time() - search_start
                 avg_run_time = elapsed_total / (global_idx + 1)
                 eta_remaining = avg_run_time * (n_total - global_idx - 1)
@@ -1493,16 +1593,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 f"eta: {eta:.4f}, omega: {omega:.4f} #############"
             )
 
-            config_start = time.time()
-            samples, labels = self.sample(
-                is_test=True,
-                save_samples=self.cfg.general.save_samples,
-                save_visualization=False,
-            )
-            res = self.evaluate_samples(
-                samples=samples, labels=labels, is_test=True
-            )
-            config_time = time.time() - config_start
+            samples, labels, res, config_time = self._sample_and_evaluate()
             print(f"  -> took {config_time:.2f}s")
             mean_res = {f"{key}_mean": res[key][0] for key in res}
             std_res = {f"{key}_std": res[key][1] for key in res}
@@ -1878,16 +1969,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                     f"{distortor}, eta: {eta:.4f}, omega: {omega:.4f} "
                     f"(trial_idx {trial_idx}) #############"
                 )
-                config_start = time.time()
-                samples, labels = self.sample(
-                    is_test=True,
-                    save_samples=self.cfg.general.save_samples,
-                    save_visualization=False,
-                )
-                res = self.evaluate_samples(
-                    samples=samples, labels=labels, is_test=True
-                )
-                config_time = time.time() - config_start
+                samples, labels, res, config_time = self._sample_and_evaluate()
                 elapsed_total = time.time() - search_start
 
                 avg_run_time = elapsed_total / (executed_idx + 1)
@@ -2058,16 +2140,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                     f"eta: {eta:.4f}, omega: {omega:.4f} "
                     f"(trial_idx {trial_idx}) #############"
                 )
-                config_start = time.time()
-                samples, labels = self.sample(
-                    is_test=True,
-                    save_samples=self.cfg.general.save_samples,
-                    save_visualization=False,
-                )
-                res = self.evaluate_samples(
-                    samples=samples, labels=labels, is_test=True
-                )
-                config_time = time.time() - config_start
+                samples, labels, res, config_time = self._sample_and_evaluate()
                 elapsed_total = time.time() - search_start
                 
                 avg_run_time = elapsed_total / (executed_idx + 1)
