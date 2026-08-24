@@ -120,9 +120,14 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             alpha=1,
             beta=1,
             derived_curve_path=derived_curve,
+            derived_lambda=float(
+                getattr(cfg.sample, "derived_distortion_lambda", 0.0)
+            ),
             derived_signal=getattr(
                 cfg.sample, "derived_distortion_signal", "soft_combined"
             ),
+            distortion_a=getattr(cfg.sample, "distortion_a", 1.0),
+            distortion_b=getattr(cfg.sample, "distortion_b", 1.0),
         )
 
         # per-step structural probes over the sampling trajectory (Phase 2).
@@ -1193,12 +1198,6 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
     def _sample_and_evaluate(self):
         """Generate and evaluate one sampling configuration.
-
-        Generation and evaluation are timed separately: truncating the
-        trajectory early only saves the former, so this split is what decides
-        whether early stopping is worth anything on a given dataset. On planar
-        generation dominates; on SBM the 5-fold bootstrap evaluation does.
-
         Returns (samples, labels, res, config_time); the two halves are left on
         self._last_sample_time / self._last_eval_time for the caller to log.
         """
@@ -1267,10 +1266,8 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         results_df = pd.DataFrame()
         distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
         # distortion_list = ["identity", "polydec"]
-        if self.time_distorter.has_derived():
-            # the data-derived schedule, benchmarked head to head against the
-            # hand-drawn ones under the identical protocol
-            distortion_list.append("derived")
+        # if self.time_distorter.has_derived():
+        #     distortion_list += ["derived_lam1", "derived_lam0"]
 
         for num_step in num_step_list:
             for distortor in distortion_list:
@@ -1587,6 +1584,9 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 "distortor": str(row["time_distortion"]).strip(),
                 "eta": float(row["eta"]),
                 "omega": float(row["omega"]),
+                # only used by time_distortion 'continuous' (Kumaraswamy a, b)
+                "a": float(row.get("distortion_a", 1.0)),
+                "b": float(row.get("distortion_b", 1.0)),
             }
             for _, row in df.iterrows()
         ]
@@ -1594,9 +1594,9 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
     def search_fixed_configs(self):
         """
-        Evaluate a fixed list of sampling configs read from a CSV.
-        """
-        num_step = 50
+        Evaluate a fixed list of sampling configs read from a CSV"""
+        num_step_list = [5, 10, 25, 50, 100, 250, 500, 1000]
+        seed_list = [0, 1, 2]
         configs, csv_path = self._load_fixed_configs()
         results_df = pd.DataFrame()
 
@@ -1605,7 +1605,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         print(
             f"Evaluating {len(configs)} fixed config(s) at num_steps "
-            f"{num_step} from {csv_path}"
+            f"{num_step_list}, seeds {seed_list} from {csv_path}"
         )
 
         for config_idx, config in enumerate(configs):
@@ -1613,35 +1613,52 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             eta = config["eta"]
             omega = config["omega"]
 
-            self.cfg.sample.sample_steps = num_step
-            self.cfg.sample.time_distortion = distortor
-            self.cfg.sample.eta = eta
-            self.rate_matrix_designer.eta = eta
-            self.cfg.sample.omega = omega
-            self.rate_matrix_designer.omega = omega
+            for num_step in num_step_list:
+                for seed in seed_list:
+                    pl.seed_everything(seed)
+                    self.cfg.sample.sample_steps = num_step
+                    self.cfg.sample.time_distortion = distortor
+                    self.cfg.sample.eta = eta
+                    self.rate_matrix_designer.eta = eta
+                    self.cfg.sample.omega = omega
+                    self.rate_matrix_designer.omega = omega
+                    self.cfg.sample.distortion_a = config["a"]
+                    self.time_distorter.distortion_a = config["a"]
+                    self.cfg.sample.distortion_b = config["b"]
+                    self.time_distorter.distortion_b = config["b"]
 
-            print(
-                f"############# Fixed config {config_idx}: "
-                f"num_steps: {num_step}, distortor: {distortor}, "
-                f"eta: {eta:.4f}, omega: {omega:.4f} #############"
-            )
+                    print(
+                        f"############# Fixed config {config_idx}: "
+                        f"num_steps: {num_step}, distortor: {distortor}, "
+                        f"eta: {eta:.4f}, omega: {omega:.4f}, "
+                        f"a: {config['a']:.4f}, b: {config['b']:.4f}, "
+                        f"seed: {seed} #############"
+                    )
 
-            samples, labels, res, config_time = self._sample_and_evaluate()
-            print(f"  -> took {config_time:.2f}s")
-            mean_res = {f"{key}_mean": res[key][0] for key in res}
-            std_res = {f"{key}_std": res[key][1] for key in res}
-            mean_res.update(std_res)
+                    samples, labels, res, config_time = self._sample_and_evaluate()
+                    print(f"  -> took {config_time:.2f}s")
+                    mean_res = {f"{key}_mean": res[key][0] for key in res}
+                    std_res = {f"{key}_std": res[key][1] for key in res}
+                    mean_res.update(std_res)
 
-            res_df = pd.DataFrame([mean_res])
-            res_df["num_step"] = num_step
-            res_df["distortor"] = distortor
-            res_df["eta"] = eta
-            res_df["omega"] = omega
-            res_df["config_idx"] = config_idx
-            res_df["time_s"] = config_time
-            results_df = pd.concat([results_df, res_df], ignore_index=True)
-            # save at each step as well
-            results_df.to_csv(f"search_fixed_configs.csv")
+                    res_df = pd.DataFrame([mean_res])
+                    res_df["num_step"] = num_step
+                    res_df["distortor"] = distortor
+                    res_df["eta"] = eta
+                    res_df["omega"] = omega
+                    res_df["config_idx"] = config_idx
+                    res_df["seed"] = seed
+                    res_df["time_s"] = config_time
+                    results_df = pd.concat([results_df, res_df], ignore_index=True)
+                    # save at each step as well
+                    results_df.to_csv(f"search_fixed_configs.csv")
+                    # mean/sd over the seeds, per config and num_step
+                    results_df.groupby(["config_idx", "num_step"]).agg(
+                        avg_ratio_mean=("average_ratio_mean", "mean"),
+                        avg_ratio_sd=("average_ratio_mean", "std"),
+                        vun_mean=("sampling/frac_unic_non_iso_valid_mean", "mean"),
+                        vun_sd=("sampling/frac_unic_non_iso_valid_mean", "std"),
+                    ).to_csv("search_fixed_configs_seed_stats.csv")
 
         # set back to default values
         self.cfg.sample.time_distortion = "identity"
@@ -1653,7 +1670,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         # save the final results
         results_df.reset_index(inplace=True)
         results_df.set_index(
-            ["num_step", "distortor", "eta", "omega"], inplace=True
+            ["num_step", "distortor", "eta", "omega", "seed"], inplace=True
         )
         results_df.to_csv(f"search_fixed_configs.csv")
 
@@ -1702,6 +1719,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             plot_builders = {
                 "optimization_history": lambda: viz.plot_optimization_history(study),
                 "slice": lambda: viz.plot_slice(study),
+                "param_importances": lambda: viz.plot_param_importances(study),
             }
         else:
             plot_builders = {
@@ -1718,6 +1736,11 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 )
                 plot_builders[f"slice_{name}"] = (
                     lambda target=target, name=name: viz.plot_slice(
+                        study, target=target, target_name=name
+                    )
+                )
+                plot_builders[f"param_importances_{name}"] = (
+                    lambda target=target, name=name: viz.plot_param_importances(
                         study, target=target, target_name=name
                     )
                 )
@@ -1749,6 +1772,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         search_label="bo",
         drop_missing_objective=True,
         auto_checkpoint_path=None,
+        required_cols=("num_step", "distortor", "eta", "omega", "trial_idx"),
     ):
         if isinstance(objective_col, str):
             objective_col = [objective_col]
@@ -1779,7 +1803,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         df = df.loc[:, ~df.columns.str.match(r"^Unnamed")]
         df = df.drop(columns=[c for c in ("index",) if c in df.columns])
 
-        required = {"num_step", "distortor", "eta", "omega", "trial_idx", *objective_col}
+        required = {*required_cols, *objective_col}
         missing = required - set(df.columns)
         if missing:
             raise ValueError(
@@ -1825,21 +1849,70 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 f"search_random_omega_range and the optuna version all match it."
             )
 
-    def _replay_bo_trials(self, study, resume_df, num_step, search_space, objective_cols):
+    def _bo_distortion_space(self, mode):
+        """Optuna distribution(s) for the distortion dimension(s), by mode."""
+        import optuna
+
+        if mode == "continuous":
+            a_low, a_high = self.cfg.sample.search_random_distortion_a_range
+            b_low, b_high = self.cfg.sample.search_random_distortion_b_range
+            return {
+                "distortion_a": optuna.distributions.FloatDistribution(a_low, a_high),
+                "distortion_b": optuna.distributions.FloatDistribution(b_low, b_high),
+            }
+        elif mode == "categorical":
+            distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
+            return {
+                "time_distortion": optuna.distributions.CategoricalDistribution(
+                    distortion_list
+                ),
+            }
+        else:
+            raise ValueError(
+                f"Unknown search_bo_distortion_mode '{mode}'. "
+                f"Choose 'continuous' or 'categorical'."
+            )
+
+    def _bo_apply_distortion(self, trial, mode):
+        """Push this trial's distortion param(s) live; return (label, {col: value})."""
+        if mode == "continuous":
+            a = float(trial.params["distortion_a"])
+            b = float(trial.params["distortion_b"])
+            self.cfg.sample.time_distortion = "continuous"
+            self.cfg.sample.distortion_a = a
+            self.time_distorter.distortion_a = a
+            self.cfg.sample.distortion_b = b
+            self.time_distorter.distortion_b = b
+            return f"distortion_a: {a:.4f}, distortion_b: {b:.4f}", {
+                "distortion_a": a, "distortion_b": b,
+            }
+        else:
+            d = trial.params["time_distortion"]
+            self.cfg.sample.time_distortion = d
+            return f"distortor: {d}", {"distortor": d}
+
+    def _bo_reset_distortion(self):
+        self.cfg.sample.time_distortion = "identity"
+        self.cfg.sample.distortion_a = 1.0
+        self.time_distorter.distortion_a = 1.0
+        self.cfg.sample.distortion_b = 1.0
+        self.time_distorter.distortion_b = 1.0
+
+    def _replay_bo_trials(self, study, resume_df, num_step, search_space, objective_cols, mode):
         prior = resume_df[resume_df["num_step"] == num_step].sort_values("trial_idx")
         for replay_idx, (_, row) in enumerate(prior.iterrows()):
             with torch.inference_mode(False), torch.enable_grad():
                 trial = study.ask(search_space)
-            got = {
-                "eta": float(trial.params["eta"]),
-                "omega": float(trial.params["omega"]),
-                "time_distortion": str(trial.params["time_distortion"]),
-            }
-            recorded = {
-                "eta": row["eta"],
-                "omega": row["omega"],
-                "time_distortion": str(row["distortor"]),
-            }
+            got = {"eta": float(trial.params["eta"]), "omega": float(trial.params["omega"])}
+            recorded = {"eta": row["eta"], "omega": row["omega"]}
+            if mode == "continuous":
+                got["distortion_a"] = float(trial.params["distortion_a"])
+                got["distortion_b"] = float(trial.params["distortion_b"])
+                recorded["distortion_a"] = row["distortion_a"]
+                recorded["distortion_b"] = row["distortion_b"]
+            else:
+                got["time_distortion"] = str(trial.params["time_distortion"])
+                recorded["time_distortion"] = str(row["distortor"])
             self._assert_replay_matches(got, recorded, num_step, replay_idx, "BO")
             value = (
                 float(row[objective_cols[0]])
@@ -1896,7 +1969,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-        distortion_list = ["identity", "polydec", "cos", "revcos", "polyinc"]
+        distortion_mode = getattr(self.cfg.sample, "search_bo_distortion_mode", "continuous")
         eta_low, eta_high = self.cfg.sample.search_random_eta_range
         omega_low, omega_high = self.cfg.sample.search_random_omega_range
         n_trials = self.cfg.sample.search_n_trials
@@ -1923,9 +1996,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
         search_space = {
             "eta": optuna.distributions.FloatDistribution(eta_low, eta_high),
             "omega": optuna.distributions.FloatDistribution(omega_low, omega_high),
-            "time_distortion": optuna.distributions.CategoricalDistribution(
-                distortion_list
-            ),
+            **self._bo_distortion_space(distortion_mode),
         }
 
         version_dir = self._search_version_dir(
@@ -1934,6 +2005,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 self.cfg.dataset.name,
                 sampler_name,
                 objective_choice,
+                distortion_mode,
                 f"seed{self.cfg.sample.search_seed}",
             ),
         )
@@ -1942,11 +2014,16 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             version_dir, "search_bayesian_optimization.csv"
         )
 
+        distortion_cols = (
+            ("distortion_a", "distortion_b") if distortion_mode == "continuous"
+            else ("distortor",)
+        )
         resume_df, resume_path = self._load_search_resume_df(
             objective_cols,
             csv_name="search_bayesian_optimization.csv",
             search_label="BO",
             auto_checkpoint_path=checkpoint_path,
+            required_cols=("num_step", *distortion_cols, "eta", "omega", "trial_idx"),
         )
         n_prior, n_total, trial_idx = self._begin_resumable_search(
             resume_df, resume_path, num_step_list, n_trials
@@ -1971,7 +2048,7 @@ class GraphDiscreteFlowModel(pl.LightningModule):
             n_done = n_prior[num_step]
             if n_done:
                 self._replay_bo_trials(
-                    study, resume_df, num_step, search_space, objective_cols
+                    study, resume_df, num_step, search_space, objective_cols, distortion_mode
                 )
                 print(
                     f"Replayed {n_done} completed trial(s) for num_step={num_step} "
@@ -1987,10 +2064,11 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                     trial = study.ask(search_space)
                 eta = float(trial.params["eta"])
                 omega = float(trial.params["omega"])
-                distortor = trial.params["time_distortion"]
+                distortion_label, distortion_cols_val = self._bo_apply_distortion(
+                    trial, distortion_mode
+                )
 
                 self.cfg.sample.sample_steps = num_step
-                self.cfg.sample.time_distortion = distortor
                 self.cfg.sample.eta = eta
                 self.rate_matrix_designer.eta = eta
                 self.cfg.sample.omega = omega
@@ -1998,8 +2076,8 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
                 print(
                     f"############# [{executed_idx + 1}/{n_total}] BO trial "
-                    f"({sampler_name}): num_steps: {num_step}, distortor: "
-                    f"{distortor}, eta: {eta:.4f}, omega: {omega:.4f} "
+                    f"({sampler_name}): num_steps: {num_step}, {distortion_label}, "
+                    f"eta: {eta:.4f}, omega: {omega:.4f} "
                     f"(trial_idx {trial_idx}) #############"
                 )
                 samples, labels, res, config_time = self._sample_and_evaluate()
@@ -2025,7 +2103,8 @@ class GraphDiscreteFlowModel(pl.LightningModule):
 
                 res_df = pd.DataFrame([mean_res])
                 res_df["num_step"] = num_step
-                res_df["distortor"] = distortor
+                for col, val in distortion_cols_val.items():
+                    res_df[col] = val
                 res_df["eta"] = eta
                 res_df["omega"] = omega
                 res_df["pair_idx"] = step_trial_idx
@@ -2050,11 +2129,19 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                 )
 
 
-        self.cfg.sample.time_distortion = "identity"
+        self._bo_reset_distortion()
         self.cfg.sample.eta = 0.0
         self.rate_matrix_designer.eta = 0.0
         self.cfg.sample.omega = 0.0
         self.rate_matrix_designer.omega = 0.0
+
+        def _distortion_str(params):
+            if distortion_mode == "continuous":
+                return (
+                    f"distortion_a={params['distortion_a']:.4f}, "
+                    f"distortion_b={params['distortion_b']:.4f}"
+                )
+            return f"time_distortion={params['time_distortion']}"
 
         info = list(self._search_summary_info)
         info.append(f"total_trials_after_run: {len(results_df)}")
@@ -2067,20 +2154,20 @@ class GraphDiscreteFlowModel(pl.LightningModule):
                     info.append(
                         f"  avg_ratio={values[0]:.6f}, vun={values[1]:.6f} at "
                         f"eta={params['eta']:.4f}, omega={params['omega']:.4f}, "
-                        f"time_distortion={params['time_distortion']}"
+                        f"{_distortion_str(params)}"
                     )
             else:
                 best_value, best_params = entry
                 info.append(
                     f"best[num_step={num_step}]: {objective_choice}={best_value:.6f} "
                     f"at eta={best_params['eta']:.4f}, omega={best_params['omega']:.4f}, "
-                    f"time_distortion={best_params['time_distortion']}"
+                    f"{_distortion_str(best_params)}"
                 )
         self._search_summary_info = info
 
         results_df.reset_index(inplace=True)
         results_df.set_index(
-            ["num_step", "distortor", "eta", "omega"], inplace=True
+            ["num_step", *distortion_cols, "eta", "omega"], inplace=True
         )
         self._save_search_checkpoint(results_df, checkpoint_path)
         self._mark_search_done(version_dir)

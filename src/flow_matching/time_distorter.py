@@ -25,6 +25,12 @@ def objective_function(alpha, beta, y, t):
     return error
 
 
+def kumaraswamy_cdf(t, a, b):
+    """F(t;a,b) = 1-(1-t^a)^b"""
+    t = t.clamp(0.0, 1.0)
+    return 1.0 - (1.0 - t**a) ** b
+
+
 def find_decoding_error_curve(dataset_name, root=None):
     """Newest outputs/decoding_error_<dataset>/version_*/decoding_error.csv, or None."""
     root = root or os.getcwd()
@@ -36,8 +42,15 @@ def find_decoding_error_curve(dataset_name, root=None):
     return matches[-1] if matches else None
 
 
-def build_derived_lut(csv_path, signal="soft_combined", n_lut=4097):
-    """Measured P_e(t) curve -> LUT for t(tau), tau=(P_e(0)-P_e(t))/(P_e(0)-P_e(1))."""
+def build_derived_lut(csv_path, signal="soft_combined", n_lut=4097, lam=0.0,
+                      floor=1e-6):
+    """Measured P_e(t) curve -> LUT for t(tau).
+
+        phi_lam(x) = (x**lam - 1)/lam     for lam != 0
+        phi_0(x)   = log(x)
+        tau(t)     = (phi(P_e(0)) - phi(P_e(t))) / (phi(P_e(0)) - phi(P_e(1)))
+
+    """
     import pandas as pd
 
     df = pd.read_csv(csv_path)
@@ -53,7 +66,27 @@ def build_derived_lut(csv_path, signal="soft_combined", n_lut=4097):
         raise ValueError(
             f"P_e is flat in '{signal}' ({csv_path}): no schedule can be derived."
         )
-    tau = (pe[0] - pe) / span
+
+    # lam <= 0 needs strictly positive errors: pe_combined reaches exactly 0 at
+    # t=1 on planar, and log(0) would swallow the whole schedule.
+    pe_pos = np.maximum(pe, floor)
+    if lam == 0.0:
+        v = np.log(pe_pos)
+    else:
+        v = (pe_pos**lam - 1.0) / lam
+
+    dyn_range = pe_pos[0] / pe_pos[-1]
+    print(
+        f"[derived] signal={signal} lam={lam}  P_e: {pe[0]:.5f} -> {pe[-1]:.5f} "
+        f"(dynamic range {dyn_range:.0f}x)"
+    )
+    if lam <= 0.0 and pe[-1] < floor:
+        print(
+            f"[derived] WARNING: P_e(1)={pe[-1]:.2e} clamped to floor={floor:.1e}; "
+            f"the tail of the schedule is set by that floor, not by data."
+        )
+
+    tau = (v[0] - v) / (v[0] - v[-1])
     tau = np.maximum.accumulate(np.clip(tau, 0.0, 1.0))
 
     tau_u, idx = np.unique(tau, return_index=True)
@@ -84,11 +117,18 @@ class TimeDistorter:
         beta=1,
         derived_curve_path=None,
         derived_signal="soft_combined",
+        derived_lambda=0.0,
+        distortion_a=1.0,
+        distortion_b=1.0,
     ):
         self.train_distortion = train_distortion  # used for sample_ft
         self.sample_distortion = sample_distortion  # used for get_ft
         self.alpha = alpha
         self.beta = beta
+        # 'continuous' distortion: Kumaraswamy(a, b), mutated live by the
+        # searches the same way rate_matrix_designer.eta/omega are.
+        self.distortion_a = distortion_a
+        self.distortion_b = distortion_b
         print(
             f"TimeDistorter: train_distortion={train_distortion}, sample_distortion={sample_distortion}"
         )
@@ -97,35 +137,46 @@ class TimeDistorter:
         # 'derived' distortion, loaded eagerly so a bad curve fails at construction.
         self.derived_curve_path = derived_curve_path
         self.derived_signal = derived_signal
-        self._derived_lut = None
+        self.derived_lambda = derived_lambda
+        self._derived_luts = {}
         self._derived_lut_cache = {}
         if derived_curve_path is not None:
-            self._derived_lut = build_derived_lut(derived_curve_path, derived_signal)
+            for name, lam in (
+                ("derived", derived_lambda),
+                ("derived_lam1", 1.0),
+                ("derived_lam0", 0.0),
+            ):
+                self._derived_luts[name] = build_derived_lut(
+                    derived_curve_path, derived_signal, lam=lam
+                )
             print(
-                f"TimeDistorter: derived schedule from {derived_curve_path} "
-                f"(signal={derived_signal})"
+                f"TimeDistorter: derived schedules from {derived_curve_path} "
+                f"(signal={derived_signal}, derived->lambda={derived_lambda}, "
+                f"plus derived_lam1 and derived_lam0)"
             )
 
-    def has_derived(self):
-        return self._derived_lut is not None
+    DERIVED_NAMES = ("derived", "derived_lam1", "derived_lam0")
 
-    def _derived_table(self, device, dtype):
-        key = (device, dtype)
+    def has_derived(self):
+        return bool(self._derived_luts)
+
+    def _derived_table(self, name, device, dtype):
+        key = (name, device, dtype)
         if key not in self._derived_lut_cache:
             self._derived_lut_cache[key] = torch.as_tensor(
-                self._derived_lut, device=device, dtype=dtype
+                self._derived_luts[name], device=device, dtype=dtype
             )
         return self._derived_lut_cache[key]
 
-    def _apply_derived(self, t):
+    def _apply_derived(self, t, name="derived"):
         """Linear read of the LUT, keeping everything on-device and shaped like t."""
-        if self._derived_lut is None:
+        if not self._derived_luts:
             raise ValueError(
-                "time_distortion='derived' needs a measured curve. Run with "
+                f"time_distortion='{name}' needs a measured curve. Run with "
                 "sample.measure_decoding_error=True first, or point "
                 "sample.derived_distortion_curve at a decoding_error.csv."
             )
-        lut = self._derived_table(t.device, t.dtype)
+        lut = self._derived_table(name, t.device, t.dtype)
         n = lut.numel()
         pos = t.clamp(0.0, 1.0) * (n - 1)
         lo = pos.floor().long().clamp(0, n - 2)
@@ -215,8 +266,10 @@ class TimeDistorter:
             ft = t**2
         elif distortion_type == "polydec":
             ft = 2 * t - t**2
-        elif distortion_type == "derived":
-            ft = self._apply_derived(t)
+        elif distortion_type in self.DERIVED_NAMES:
+            ft = self._apply_derived(t, distortion_type)
+        elif distortion_type == "continuous":
+            ft = kumaraswamy_cdf(t, self.distortion_a, self.distortion_b)
         elif distortion_type == "beta":
             raise ValueError(f"Unsupported for now: {distortion_type}")
         elif distortion_type == "logitnormal":

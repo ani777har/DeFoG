@@ -4,10 +4,13 @@ omega: 0.
 
 # generation settings
 sample_steps: 50
-time_distortion: "identity"     # 'identity', 'cosine', polyinc, polydec, derived
+time_distortion: "identity"     # 'identity', 'cosine', polyinc, polydec, derived, continuous
+distortion_a: 1.0
+distortion_b: 1.0
 
 # 'derived' time distortion
 derived_distortion_curve: null
+derived_distortion_lambda: 0.0
 derived_distortion_signal: soft_combined  # column of decoding_error.csv to build tau from
                                           # ('soft_combined' | 'pe_combined' | 'ce_combined';
                                           #  pe_* saturates at 2 edge classes -- it is exactly
@@ -36,16 +39,19 @@ probe_validity_every: 0       # >0: every k steps, run the dataset validity chec
 probe_validity_max_graphs: 8  # graphs per batch to check (CPU-side, keep small)
 
 # shared across the 'random', 'bo' and 'sobol' searches
-search_n_trials: 140   # total trials per num_step
-search_seed: 21 # anishok defaulty 42 er
+search_n_trials: 25   # total trials per num_step
+search_seed: 0 # anishok defaulty 42 er
 
-search_random_eta_range: [0.0, 100.0]
-search_random_omega_range: [0.0, 0.5]
+search_random_eta_range: [0.0, 200.0]
+search_random_omega_range: [0.0, 2.0]
 search_random_omega_root: 1.0  # omega = lo + (hi-lo)*(1 - u**root); <1 concentrates draws near lo (0), 1.0 = no transform (uniform)
+search_random_distortion_a_range: [0.2, 5.0]  # Kumaraswamy a; [1,1] identity sits inside this range
+search_random_distortion_b_range: [0.2, 5.0]  # Kumaraswamy b
 
 
 search_bo_sampler: tpe   # 'gp' | 'tpe' | 'hebo'  (hebo needs: pip install optunahub hebo pymoo)
-search_bo_n_startup_trials: 10  # 'gp'/'tpe' only; hebo manages its own initial design
+search_bo_n_startup_trials: 5  # 'gp'/'tpe' only; hebo manages its own initial design
+search_bo_distortion_mode: continuous  # 'continuous' (distortion_a/b, Kumaraswamy) | 'categorical' (the 5 named curves)
 search_bo_objective: average_ratio  # BO objective: 'average_ratio' (minimized) | 'vun' (maximized) | 'both' (multi-objective Pareto search; 'gp'/'tpe'/'hebo')
 search_bo_visualize: True
 
