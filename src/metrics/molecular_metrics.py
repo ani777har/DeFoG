@@ -134,6 +134,10 @@ class SamplingMolecularMetrics(nn.Module):
             molecules, self.train_smiles, self.dataset_info, labels, self.cfg, test
         )
 
+        to_log["sampling/frac_unic_non_iso_valid"] = (
+            to_log["Relaxed Validity"] * to_log["Uniqueness"] * to_log["Novelty"]
+        )
+
         if test and local_rank == 0:
             with open(r"final_smiles.txt", "w") as fp:
                 for smiles in all_smiles:
