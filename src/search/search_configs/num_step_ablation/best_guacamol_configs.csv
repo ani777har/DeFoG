@@ -1,0 +1,5 @@
+method,objective,time,a,b,eta,omega
+vanila,vun,identity,1.0,1.0,0.0,0.0
+axis independent,vun,polydec,1.0,1.0,100,0.0
+gp,vun,continuous,0.2,2.28,200,0.03
+hebo,vun,continuous,0.578738,2.1626,93.935694,1.257841

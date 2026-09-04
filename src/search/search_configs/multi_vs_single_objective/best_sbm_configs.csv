@@ -1,0 +1,10 @@
+method,objective,time,a,b,eta,omega
+vanila,identity,1,1,0,0
+axis independent,both,polyinc,1,1,10,0.02
+axis independent,ratio,polyinc,1,1,0,0.01
+gp,both,continuous,2.459,0.605,0,0
+gp,vun,continuous,3.518,5,0,0
+gp,ratio,continuous,0.2,0.2,0,0.082801
+hebo,both,continuous,0.2,0.202,9.414,0
+hebo,vun,continuous,4.677,4.591569,3.99,0.174171
+hebo,ratio,continuous,0.821,0.2,0.004,0.059
