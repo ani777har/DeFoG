@@ -24,8 +24,8 @@ train:
     time_distortion: 'polydec'
 sample:
     time_distortion: 'polydec'
-    omega: 0.1
-    eta: 300
+    omega: 0.0 # 0.1 anishok
+    eta: 0.0 # 300 anishok
 model:
     n_layers: 12
     type: 'discrete'

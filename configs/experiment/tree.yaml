@@ -10,7 +10,7 @@ general:
     samples_to_generate: 40
     samples_to_save: 9
     chains_to_save: 1
-    final_model_samples_to_generate: 40
+    final_model_samples_to_generate: 50
     final_model_samples_to_save: 30
     final_model_chains_to_save: 20
     sample_steps: 1000

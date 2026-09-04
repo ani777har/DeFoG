@@ -21,15 +21,15 @@ general:
 train:
     optimizer: adamw
     n_epochs: 300
-    batch_size: 256
+    batch_size: 512
     save_model: True
     lr: 2e-4
     num_workers: 4
     time_distortion: 'polydec'
 sample:
     time_distortion: 'polydec'
-    omega: 0.5
-    eta: 200
+    omega: 0.0 # 0.5 anishok
+    eta: 0.0 # 200 anishok
 model:
     n_layers: 12
     type: 'discrete'
