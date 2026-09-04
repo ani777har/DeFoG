@@ -26,6 +26,7 @@ warnings.filterwarnings("ignore", category=PossibleUserWarning)
 def main(cfg: DictConfig):
     pl.seed_everything(cfg.train.seed)
     dataset_config = cfg["dataset"]
+    is_molecular = False
 
     if dataset_config["name"] in [
         "sbm",
@@ -79,6 +80,7 @@ def main(cfg: DictConfig):
 
 
     elif dataset_config["name"] in ["qm9", "guacamol", "moses", "zinc"]:
+        is_molecular = True
         from metrics.molecular_metrics import (
             TrainMolecularMetrics,
             SamplingMolecularMetrics,
@@ -188,10 +190,19 @@ def main(cfg: DictConfig):
     else:
         raise NotImplementedError("Unknown dataset {}".format(cfg["dataset"]))
 
-    dataset_infos.compute_reference_metrics(
-        datamodule=datamodule,
-        sampling_metrics=sampling_metrics,
-    )
+    if is_molecular:
+        # Reference metrics are only read by compute_ratios(), and
+        # SamplingMolecularMetrics.forward forces compute_fcd=False, so it is always
+        # called with an empty metrics_keys and never touches ref_metrics. Computing
+        # them means running the whole metric suite over the entire training set twice
+        # (days on guacamol) for a result that is discarded.
+        print("Skipping reference metrics: unused for molecular datasets.")
+        dataset_infos.ref_metrics = {"val": None, "test": None}
+    else:
+        dataset_infos.compute_reference_metrics(
+            datamodule=datamodule,
+            sampling_metrics=sampling_metrics,
+        )
 
     model_kwargs = {
         "dataset_infos": dataset_infos,
