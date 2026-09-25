@@ -1,0 +1,6 @@
+trial,method,objective,time,a,b,eta,omega
+100,gp,both,continuous,0.2,3.054103,64.937918,2
+25,gp,both,continuous,0.2,4.211265,200,2
+100,hebo,both,continuous,0.211361,3.235044,149.368818,0.032834
+25,hebo,both,continuous,0.2,4.272162,122.802999,2
+25,hebo,both_1,continuous,0.2,4.999837,0.000133,1.711407
