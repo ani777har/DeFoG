@@ -396,8 +396,8 @@ class HyperparameterSearchMixin(SearchUtilsMixin):
 
     def search_fixed_configs(self):
         """Evaluate a fixed list of sampling configs read from a CSV."""
-        num_step_list = [50]
-        sample_size_list = [10, 50, 100, 500, 1000]
+        num_step_list = [5, 10, 25, 50, 100, 250, 500, 1000]
+        sample_size_list = [self.cfg.general.final_model_samples_to_generate]
         seed_list = [0, 1, 2]
         configs, csv_path, csv_header = self._load_fixed_configs()
         results_df = pd.DataFrame()
@@ -407,9 +407,10 @@ class HyperparameterSearchMixin(SearchUtilsMixin):
         configs_df = pd.DataFrame(
             [dict(config["row"], config_idx=idx) for idx, config in enumerate(configs)]
         )
-        # method, objective, time, a, b, eta, omega, config_idx, num_step,
-        # n_samples, stats
+        # [trial], method, objective, time, a, b, eta, omega, config_idx,
+        # num_step, n_samples, stats
         stats_cols = csv_header + ["config_idx", "num_step", "n_samples"]
+        label_cols = self._fixed_config_label_cols(csv_header)
 
         # writes in the hydra run directory
         self._probe_set_dir(os.getcwd())
@@ -440,9 +441,12 @@ class HyperparameterSearchMixin(SearchUtilsMixin):
                         self.cfg.sample.distortion_b = config["b"]
                         self.time_distorter.distortion_b = config["b"]
 
+                        label = "/".join(
+                            str(config["row"][col]) for col in label_cols
+                        )
                         print(
                             f"############# Fixed config {config_idx} "
-                            f"({config['row']['method']}/{config['row']['objective']}): "
+                            f"({label}): "
                             f"n_samples: {n_samples}, num_steps: {num_step}, "
                             f"distortor: {distortor}, "
                             f"eta: {eta:.4f}, omega: {omega:.4f}, "
@@ -464,8 +468,8 @@ class HyperparameterSearchMixin(SearchUtilsMixin):
                         res_df["omega"] = omega
                         res_df["distortion_a"] = config["a"]
                         res_df["distortion_b"] = config["b"]
-                        res_df["method"] = config["row"]["method"]
-                        res_df["objective"] = config["row"]["objective"]
+                        for col in label_cols:
+                            res_df[col] = config["row"][col]
                         res_df["config_idx"] = config_idx
                         res_df["seed"] = seed
                         res_df["time_s"] = config_time

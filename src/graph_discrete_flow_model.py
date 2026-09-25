@@ -12,17 +12,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.distributions.categorical import Categorical
-from hydra.utils import get_original_cwd
 from models.transformer_model import GraphTransformer
 
 from metrics.train_metrics import TrainLossDiscrete
 from src import utils
 from flow_matching.noise_distribution import NoiseDistribution
-from flow_matching.time_distorter import TimeDistorter, find_decoding_error_curve
+from flow_matching.time_distorter import TimeDistorter
 from flow_matching.rate_matrix import RateMatrixDesigner
 from flow_matching.utils import p_xt_g_x1
 from flow_matching import flow_matching_utils
 from analysis.trajectory_probes import TrajectoryProbe
+from analysis.spectre_utils import GRAPH_EVAL_CACHE
 from search import HyperparameterSearchMixin
 
 
@@ -101,30 +101,11 @@ class GraphDiscreteFlowModel(HyperparameterSearchMixin, pl.LightningModule):
         self.adapt_counter = 0
 
         # time distortor for both training and sampling steps
-        derived_curve = getattr(cfg.sample, "derived_distortion_curve", None)
-        if derived_curve is None:
-            # only auto-discover when 'derived' is actually asked for, so a
-            # stale curve on disk can never silently change another run
-            wants_derived = "derived" in (
-                str(cfg.sample.time_distortion),
-                str(cfg.train.time_distortion),
-            ) or bool(cfg.sample.search)
-            if wants_derived:
-                derived_curve = find_decoding_error_curve(
-                    cfg.dataset.name, root=os.path.join(get_original_cwd(), "..")
-                )
         self.time_distorter = TimeDistorter(
             train_distortion=cfg.train.time_distortion,
             sample_distortion=cfg.sample.time_distortion,
             alpha=1,
             beta=1,
-            derived_curve_path=derived_curve,
-            derived_lambda=float(
-                getattr(cfg.sample, "derived_distortion_lambda", 0.0)
-            ),
-            derived_signal=getattr(
-                cfg.sample, "derived_distortion_signal", "soft_combined"
-            ),
             distortion_a=getattr(cfg.sample, "distortion_a", 1.0),
             distortion_b=getattr(cfg.sample, "distortion_b", 1.0),
         )
@@ -300,7 +281,7 @@ class GraphDiscreteFlowModel(HyperparameterSearchMixin, pl.LightningModule):
             samples, labels = self.sample(
                 is_test=True,
                 save_samples=self.cfg.general.save_samples,
-                save_visualization=True,
+                save_visualization=False,
             )
             if self.trajectory_probe is not None:
                 self.trajectory_probe.end_trial()
@@ -369,12 +350,10 @@ class GraphDiscreteFlowModel(HyperparameterSearchMixin, pl.LightningModule):
             to_save = min(samples_left_to_save, bs)
             chains_save = min(chains_left_to_save, bs)
             num_chain_steps = min(self.number_chain_steps, self.sample_T)
-            # None (the default) draws sizes from the training node distribution
-            fixed_num_nodes = getattr(self.cfg.sample, "num_nodes", None)
             cur_samples, cur_labels = self.sample_batch(
                 graph_id,
                 to_generate,
-                num_nodes=int(fixed_num_nodes) if fixed_num_nodes is not None else None,
+                num_nodes=None,
                 save_final=to_save,
                 keep_chain=chains_save,
                 number_chain_steps=num_chain_steps,
@@ -424,6 +403,13 @@ class GraphDiscreteFlowModel(HyperparameterSearchMixin, pl.LightningModule):
         save_filename="",
     ):
         print("Computing sampling metrics...")
+
+        # Folds re-score overlapping subsets of one generated pool, so per-graph
+        # validity is cached for this config and dropped before the next one.
+        # Only the sbm experiment sets the flag (the cache only wraps is_sbm_graph).
+        GRAPH_EVAL_CACHE.reset(
+            enabled=self.cfg.general.get("cache_graph_eval", False)
+        )
 
         to_log = {}
         samples_to_evaluate = self.cfg.general.final_model_samples_to_generate
@@ -481,6 +467,7 @@ class GraphDiscreteFlowModel(HyperparameterSearchMixin, pl.LightningModule):
                 i: (np.array(to_log[i]).mean(), np.array(to_log[i]).std())
                 for i in to_log
             }
+            print(GRAPH_EVAL_CACHE.summary())
         else:
             to_log = self.sampling_metrics.forward(
                 samples,
@@ -493,6 +480,9 @@ class GraphDiscreteFlowModel(HyperparameterSearchMixin, pl.LightningModule):
                 labels=labels if self.conditional else None,
             )
 
+        # the trajectory probe calls is_sbm_graph while sampling the next config,
+        # so the cache stays off outside evaluation
+        GRAPH_EVAL_CACHE.reset(enabled=False)
         return to_log
 
     def apply_noise(self, X, E, y, node_mask, t=None):
@@ -559,14 +549,6 @@ class GraphDiscreteFlowModel(HyperparameterSearchMixin, pl.LightningModule):
         :param keep_chain_steps: number of timesteps to save for each chain
         :return: molecule_list. Each element of this list is a tuple (atom_types, charges, positions)
         """
-        # Reseed right here so the graph sizes and the initial noise z_T are
-        # identical across runs that differ only in sampling config -- an
-        # apples-to-apples comparison of eta/omega/time_distortion. Off by
-        # default (null), since it overrides the global RNG mid-run.
-        init_noise_seed = getattr(self.cfg.sample, "init_noise_seed", None)
-        if init_noise_seed is not None:
-            pl.seed_everything(int(init_noise_seed) + batch_id, workers=False)
-
         if num_nodes is None:
             n_nodes = self.node_dist.sample_n(batch_size, self.device)
         elif type(num_nodes) == int:

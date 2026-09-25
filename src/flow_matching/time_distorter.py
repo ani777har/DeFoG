@@ -1,6 +1,3 @@
-import glob
-import os
-
 import torch
 import numpy as np
 from scipy.stats import norm
@@ -31,80 +28,6 @@ def kumaraswamy_cdf(t, a, b):
     return 1.0 - (1.0 - t**a) ** b
 
 
-def find_decoding_error_curve(dataset_name, root=None):
-    """Newest outputs/decoding_error_<dataset>/version_*/decoding_error.csv, or None."""
-    root = root or os.getcwd()
-    pattern = os.path.join(
-        root, "outputs", f"decoding_error_{dataset_name}", "version_*",
-        "decoding_error.csv",
-    )
-    matches = sorted(glob.glob(pattern), key=os.path.getmtime)
-    return matches[-1] if matches else None
-
-
-def build_derived_lut(csv_path, signal="soft_combined", n_lut=4097, lam=0.0,
-                      floor=1e-6):
-    """Measured P_e(t) curve -> LUT for t(tau).
-
-        phi_lam(x) = (x**lam - 1)/lam     for lam != 0
-        phi_0(x)   = log(x)
-        tau(t)     = (phi(P_e(0)) - phi(P_e(t))) / (phi(P_e(0)) - phi(P_e(1)))
-
-    """
-    import pandas as pd
-
-    df = pd.read_csv(csv_path)
-    if signal not in df.columns:
-        raise ValueError(
-            f"{csv_path} has no column '{signal}'; available: {list(df.columns)}"
-        )
-    t = df["t"].to_numpy(dtype=np.float64)
-    pe = df[signal].to_numpy(dtype=np.float64)
-
-    span = pe[0] - pe[-1]
-    if span <= 1e-12:
-        raise ValueError(
-            f"P_e is flat in '{signal}' ({csv_path}): no schedule can be derived."
-        )
-
-    # lam <= 0 needs strictly positive errors: pe_combined reaches exactly 0 at
-    # t=1 on planar, and log(0) would swallow the whole schedule.
-    pe_pos = np.maximum(pe, floor)
-    if lam == 0.0:
-        v = np.log(pe_pos)
-    else:
-        v = (pe_pos**lam - 1.0) / lam
-
-    dyn_range = pe_pos[0] / pe_pos[-1]
-    print(
-        f"[derived] signal={signal} lam={lam}  P_e: {pe[0]:.5f} -> {pe[-1]:.5f} "
-        f"(dynamic range {dyn_range:.0f}x)"
-    )
-    if lam <= 0.0 and pe[-1] < floor:
-        print(
-            f"[derived] WARNING: P_e(1)={pe[-1]:.2e} clamped to floor={floor:.1e}; "
-            f"the tail of the schedule is set by that floor, not by data."
-        )
-
-    tau = (v[0] - v) / (v[0] - v[-1])
-    tau = np.maximum.accumulate(np.clip(tau, 0.0, 1.0))
-
-    tau_u, idx = np.unique(tau, return_index=True)
-    t_u = t[idx]
-
-    grid = np.linspace(0.0, 1.0, n_lut)
-    try:
-        from scipy.interpolate import PchipInterpolator
-
-        lut = PchipInterpolator(tau_u, t_u, extrapolate=True)(grid)
-    except Exception:
-        lut = np.interp(grid, tau_u, t_u)
-
-    lut = np.maximum.accumulate(np.clip(lut, 0.0, 1.0))
-    lut[0], lut[-1] = 0.0, 1.0
-    return lut
-
-
 class TimeDistorter:
 
     def __init__(
@@ -115,9 +38,6 @@ class TimeDistorter:
         sigma=1,
         alpha=1,
         beta=1,
-        derived_curve_path=None,
-        derived_signal="soft_combined",
-        derived_lambda=0.0,
         distortion_a=1.0,
         distortion_b=1.0,
     ):
@@ -133,55 +53,6 @@ class TimeDistorter:
             f"TimeDistorter: train_distortion={train_distortion}, sample_distortion={sample_distortion}"
         )
         self.f_inv = None
-
-        # 'derived' distortion, loaded eagerly so a bad curve fails at construction.
-        self.derived_curve_path = derived_curve_path
-        self.derived_signal = derived_signal
-        self.derived_lambda = derived_lambda
-        self._derived_luts = {}
-        self._derived_lut_cache = {}
-        if derived_curve_path is not None:
-            for name, lam in (
-                ("derived", derived_lambda),
-                ("derived_lam1", 1.0),
-                ("derived_lam0", 0.0),
-            ):
-                self._derived_luts[name] = build_derived_lut(
-                    derived_curve_path, derived_signal, lam=lam
-                )
-            print(
-                f"TimeDistorter: derived schedules from {derived_curve_path} "
-                f"(signal={derived_signal}, derived->lambda={derived_lambda}, "
-                f"plus derived_lam1 and derived_lam0)"
-            )
-
-    DERIVED_NAMES = ("derived", "derived_lam1", "derived_lam0")
-
-    def has_derived(self):
-        return bool(self._derived_luts)
-
-    def _derived_table(self, name, device, dtype):
-        key = (name, device, dtype)
-        if key not in self._derived_lut_cache:
-            self._derived_lut_cache[key] = torch.as_tensor(
-                self._derived_luts[name], device=device, dtype=dtype
-            )
-        return self._derived_lut_cache[key]
-
-    def _apply_derived(self, t, name="derived"):
-        """Linear read of the LUT, keeping everything on-device and shaped like t."""
-        if not self._derived_luts:
-            raise ValueError(
-                f"time_distortion='{name}' needs a measured curve. Run with "
-                "sample.measure_decoding_error=True first, or point "
-                "sample.derived_distortion_curve at a decoding_error.csv."
-            )
-        lut = self._derived_table(name, t.device, t.dtype)
-        n = lut.numel()
-        pos = t.clamp(0.0, 1.0) * (n - 1)
-        lo = pos.floor().long().clamp(0, n - 2)
-        w = pos - lo.to(pos.dtype)
-        return lut[lo] * (1.0 - w) + lut[lo + 1] * w
 
     def train_ft(self, batch_size, device):
         t_uniform = torch.rand((batch_size, 1), device=device)
@@ -266,8 +137,6 @@ class TimeDistorter:
             ft = t**2
         elif distortion_type == "polydec":
             ft = 2 * t - t**2
-        elif distortion_type in self.DERIVED_NAMES:
-            ft = self._apply_derived(t, distortion_type)
         elif distortion_type == "continuous":
             ft = kumaraswamy_cdf(t, self.distortion_a, self.distortion_b)
         elif distortion_type == "beta":
