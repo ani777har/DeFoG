@@ -4,17 +4,10 @@ omega: 0.
 
 # generation settings
 sample_steps: 50
-time_distortion: "identity"     # 'identity', 'cosine', polyinc, polydec, derived, continuous
+time_distortion: "identity"     # 'identity', 'cosine', polyinc, polydec, continuous
 distortion_a: 1.0
 distortion_b: 1.0
 
-# 'derived' time distortion
-derived_distortion_curve: null
-derived_distortion_lambda: 0.0
-derived_distortion_signal: soft_combined  # column of decoding_error.csv to build tau from
-                                          # ('soft_combined' | 'pe_combined' | 'ce_combined';
-                                          #  pe_* saturates at 2 edge classes -- it is exactly
-                                          #  flat below t~0.33 on planar, so tau is not invertible there)
 search: False           # 'all' | 'target_guidance' | 'distortion' | 'stochasticity' | 'full_grid' | 'random' | 'bo' | 'sobol' | 'fixed_configs' | False
 
 
@@ -39,8 +32,8 @@ probe_validity_every: 0       # >0: every k steps, run the dataset validity chec
 probe_validity_max_graphs: 8  # graphs per batch to check (CPU-side, keep small)
 
 # shared across the 'random', 'bo' and 'sobol' searches
-search_n_trials: 25   # total trials per num_step
-search_seed: 0 # anishok defaulty 42 er
+search_n_trials: 50   # total trials per num_step
+search_seed: 42 # anishok defaulty 42 er
 
 search_random_eta_range: [0.0, 200.0]
 search_random_omega_range: [0.0, 2.0]
