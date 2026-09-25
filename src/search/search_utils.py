@@ -1,9 +1,4 @@
-"""Support code for the searches in :mod:`search.hyperparameter_search`.
-
-Output directories, resume/checkpoint I/O, the per-trial generate-and-evaluate
-step and the Optuna study mechanics. Mixed into ``GraphDiscreteFlowModel``, so
-``self`` is the model.
-"""
+"""Support code for the searches in :mod:`search.hyperparameter_search`."""
 
 import csv
 import os
@@ -18,7 +13,6 @@ from hydra.utils import get_original_cwd
 
 class SearchUtilsMixin:
     """Helpers shared by the sampling-hyperparameter searches."""
-
 
     def _write_search_summary(self, search_times=None):
         cfg = self.cfg.sample
@@ -74,8 +68,7 @@ class SearchUtilsMixin:
                 for name, t in search_times.items():
                     f.write(f"{name}: {t:.2f}s ({t / 60:.2f} min)\n")
 
-
-            # resumed run's time duration info
+                # resumed run's time duration info
                 prior = getattr(self, "_prior_trial_time_s", 0.0)
                 if prior:
                     this_run = search_times.get("total", 0.0)
@@ -107,11 +100,7 @@ class SearchUtilsMixin:
         return lines
 
     def _begin_resumable_search(self, resume_df, resume_path, num_step_list, n_trials):
-        """Set up the shared resume state for the ask/tell searches (BO, Sobol).
-
-        Returns (n_prior, n_total, trial_idx): completed trials per num_step, the
-        number of trials still to run this session, and the next global trial_idx.
-        """
+        """Resume state for BO/Sobol: returns (n_prior, n_total, trial_idx)."""
         n_prior = {
             ns: (0 if resume_df.empty else int((resume_df["num_step"] == ns).sum()))
             for ns in num_step_list
@@ -136,14 +125,7 @@ class SearchUtilsMixin:
         return "".join(c if (c.isalnum() or c in "-_.") else "-" for c in text)
 
     def _search_variant_name(self, search_name, tags):
-        """
-        Directory name for one *variant* of a search.
-
-        Everything that changes which configs get proposed -- dataset, sampler,
-        objective, seed -- has to be part of the name. Two runs that share a
-        directory share the resume CSV, so a run whose proposals differ would
-        otherwise be replayed as if it were the same search.
-        """
+        """Directory name for one variant (dataset, sampler, seed, ...) of a search."""
         parts = [search_name] + [
             self._slugify(t) for t in tags if t is not None and str(t) != ""
         ]
@@ -160,8 +142,7 @@ class SearchUtilsMixin:
         )
         os.makedirs(base_dir, exist_ok=True)
 
-        # Claiming a version has to be atomic: two jobs starting together would
-        # otherwise both compute the same next_version and share it.
+        # os.mkdir is the atomic claim, so concurrent jobs never share a version
         for _ in range(100):
             existing_versions = sorted(
                 int(d.split("_")[1])
@@ -183,8 +164,6 @@ class SearchUtilsMixin:
             try:
                 os.mkdir(new_dir)
             except FileExistsError:
-                # another job claimed this version between the listing and the
-                # mkdir -- rescan and try again
                 continue
             print(f"Starting search in {new_dir}")
             self._record_hydra_run(new_dir)
@@ -195,15 +174,8 @@ class SearchUtilsMixin:
             f"attempts -- too many jobs starting at once?"
         )
 
-
     def _axis_search_dir(self, search_name):
-        """outputs/<dataset>-<search_name> for the axis searches.
-
-        Flat (no version_N) and reused across runs: all seeds append to the one
-        CSV in here (with a 'seed' column), rerunning the axis overwrites it,
-        and hydra_runs.txt keeps the pointer to every hydra run directory that
-        wrote here.
-        """
+        """outputs/<dataset>-<search_name> for the axis searches, reused across runs."""
         out_dir = os.path.abspath(
             os.path.join(
                 get_original_cwd(),
@@ -233,10 +205,7 @@ class SearchUtilsMixin:
         open(os.path.join(version_dir, "DONE"), "w").close()
 
     def _sample_and_evaluate(self):
-        """Generate and evaluate one sampling configuration.
-        Returns (samples, labels, res, config_time); the two halves are left on
-        self._last_sample_time / self._last_eval_time for the caller to log.
-        """
+        """Generate and evaluate one sampling configuration."""
         if self.trajectory_probe is not None:
             self.trajectory_probe.begin_trial(
                 num_step=self.cfg.sample.sample_steps,
@@ -260,20 +229,14 @@ class SearchUtilsMixin:
         res = self.evaluate_samples(samples=samples, labels=labels, is_test=True)
         eval_time = time.time() - t1
 
-        # Injected as (mean, std) pairs so the existing
-        #   mean_res = {f"{key}_mean": res[key][0] for key in res}
-        # in every search picks them up as columns without further changes.
         res["sampling_time_s"] = (sample_time, 0.0)
         res["eval_time_s"] = (eval_time, 0.0)
 
-        self._last_sample_time = sample_time
-        self._last_eval_time = eval_time
         print(
             f"  -> generation {sample_time:.2f}s | evaluation {eval_time:.2f}s "
             f"(eval/gen = {eval_time / max(sample_time, 1e-9):.2f})"
         )
         return samples, labels, res, sample_time + eval_time
-
 
     def _load_search_checkpoint(self, csv_path, key_cols, dtypes):
         if not os.path.exists(csv_path):
@@ -294,32 +257,29 @@ class SearchUtilsMixin:
         results_df.to_csv(tmp_path)
         os.replace(tmp_path, csv_path)
 
-
     def _omega_power_transform(self, omega_linear):
-
         omega_low, omega_high = self.cfg.sample.search_random_omega_range
         span = omega_high - omega_low
         if span == 0:
             return omega_low
         root = self.cfg.sample.search_random_omega_root
         if root == 1.0:
-            # Uniform omega: the power map degenerates to the mirror u -> 1-u,
-            # so pass the draw through untouched and keep omega == omega_raw.
+            # keep omega == omega_raw instead of mirroring u -> 1-u
             return omega_linear
         u = (omega_linear - omega_low) / span
         return omega_low + (1.0 - u ** root) * span
 
+    # columns before 'time' are descriptive labels, carried through to the outputs
+    FIXED_CONFIG_HEADER = ["time", "a", "b", "eta", "omega"]
 
-    # the fixed-config CSV schema: 'time' is the time distortion, 'a'/'b' the
-    # Kumaraswamy parameters, the rest are descriptive and only carried through
-    # to the outputs
-    FIXED_CONFIG_HEADER = ["method", "objective", "time", "a", "b", "eta", "omega"]
+    @classmethod
+    def _fixed_config_label_cols(cls, header):
+        """The descriptive columns: whatever precedes the sampling schema."""
+        return header[: header.index(cls.FIXED_CONFIG_HEADER[0])]
 
-    @staticmethod
-    def _read_fixed_configs_csv(csv_path):
-        """Rows are allowed to omit one of the leading descriptive fields (the
-        vanilla row carries no 'objective'), so short rows are padded there
-        instead of at the end where the numbers live."""
+    @classmethod
+    def _read_fixed_configs_csv(cls, csv_path):
+        """Read the CSV, padding short rows inside the descriptive block."""
         with open(csv_path, newline="") as f:
             rows = [
                 [cell.strip() for cell in row]
@@ -330,13 +290,20 @@ class SearchUtilsMixin:
             raise ValueError(f"sample.search_configs_csv: '{csv_path}' is empty.")
 
         header, records = rows[0], []
+        n_labels = (
+            len(cls._fixed_config_label_cols(header))
+            if cls.FIXED_CONFIG_HEADER[0] in header
+            else 1
+        )
         for line_no, row in enumerate(rows[1:], start=2):
             if len(row) < len(header):
+                keep = max(len(row) - (len(header) - n_labels), 0)
                 print(
                     f"  [fixed_configs] line {line_no} of {os.path.basename(csv_path)} has "
-                    f"{len(row)} of {len(header)} fields, padding after '{header[0]}'"
+                    f"{len(row)} of {len(header)} fields, padding "
+                    f"{header[keep:n_labels]}"
                 )
-                row = row[:1] + [""] * (len(header) - len(row)) + row[1:]
+                row = row[:keep] + [""] * (len(header) - len(row)) + row[keep:]
             records.append(dict(zip(header, row[: len(header)])))
         return header, records
 
@@ -352,7 +319,8 @@ class SearchUtilsMixin:
         if missing:
             raise KeyError(
                 f"sample.search_configs_csv: '{csv_path}' is missing column(s) {missing}; "
-                f"expected {self.FIXED_CONFIG_HEADER}, found {header}."
+                f"expected {self.FIXED_CONFIG_HEADER} preceded by any descriptive "
+                f"column(s), found {header}."
             )
 
         defaults = {"eta": 0.0, "omega": 0.0, "a": 1.0, "b": 1.0}
@@ -361,8 +329,6 @@ class SearchUtilsMixin:
             config = {"distortor": rec["time"]}
             for col, default in defaults.items():
                 config[col] = float(rec[col]) if rec[col] != "" else default
-            # every CSV column, in its original order, so the descriptive
-            # fields (method, objective) reach the outputs
             config["row"] = dict(rec, **{col: config[col] for col in defaults})
             configs.append(config)
         return configs, csv_path, header
@@ -457,7 +423,6 @@ class SearchUtilsMixin:
                     print(f"  [viz] could not log {name} to wandb: {e}")
         print(f"  [viz] Optuna plots saved for {tag} (optuna_{tag}_*.html)")
 
-
     def _load_search_resume_df(
         self,
         objective_col,
@@ -491,8 +456,7 @@ class SearchUtilsMixin:
             return pd.DataFrame(), None
 
         df = pd.read_csv(csv_path)
-        # Drop what to_csv leaves behind: the unnamed index column, plus the bare
-        # 'index' column a *completed* sobol run's reset_index() writes out.
+        # drop to_csv's unnamed index and the 'index' column of a completed run
         df = df.loc[:, ~df.columns.str.match(r"^Unnamed")]
         df = df.drop(columns=[c for c in ("index",) if c in df.columns])
 
@@ -513,7 +477,6 @@ class SearchUtilsMixin:
             f"will be replayed into the study without re-running model inference."
         )
         return df, csv_path
-
 
     def _assert_replay_matches(self, got, recorded, num_step, replay_idx, search_label):
         mismatched = []
@@ -615,7 +578,6 @@ class SearchUtilsMixin:
             study.tell(trial, value)
         return len(prior)
 
-
     def _sobol_warmup(self, study, search_space):
         import optuna
 
@@ -637,8 +599,7 @@ class SearchUtilsMixin:
                 "eta": float(trial.params["eta"]),
                 "omega": float(trial.params["omega"]),
             }
-            # got["omega"] is the raw sampled value (pre power-transform), so it must
-            # be compared against the recorded raw draw, never the transformed omega.
+            # compare against the raw draw, not the power-transformed omega
             recorded = {
                 "eta": row["eta"],
                 "omega": row["omega_raw"],
