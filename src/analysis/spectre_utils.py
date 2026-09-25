@@ -633,11 +633,12 @@ def eval_acc_sbm_graph(
     refinement_steps=100,
     is_parallel=True,
 ):
+    # sbm_acc is scored uncached; only the VUN validity check reads GRAPH_EVAL_CACHE
     count = 0.0
     if is_parallel:
         with concurrent.futures.ThreadPoolExecutor() as executor:
             for prob in executor.map(
-                is_sbm_graph,
+                _is_sbm_graph_uncached,
                 [gg for gg in G_list],
                 [p_intra for i in range(len(G_list))],
                 [p_inter for i in range(len(G_list))],
@@ -647,7 +648,7 @@ def eval_acc_sbm_graph(
                 count += prob
     else:
         for gg in G_list:
-            count += is_sbm_graph(
+            count += _is_sbm_graph_uncached(
                 gg,
                 p_intra=p_intra,
                 p_inter=p_inter,
@@ -729,7 +730,73 @@ def is_grid_graph(G):
         return False
 
 
+############################ Per-graph validity cache ############################
+
+
+def graph_identity_key(G):
+    """Identity of G as the metrics see it: node count + adjacency bytes."""
+    adj = nx.to_numpy_array(G, dtype=np.int8)
+    return (adj.shape[0], adj.tobytes())
+
+
+class GraphEvalCache:
+    """Memorizes per-graph validity verdicts for one sampling configuration.
+
+    Not thread-safe: its only reader is the VUN validity check, which runs
+    sequentially (the threaded eval_acc_sbm_graph bypasses it).
+    """
+
+    def __init__(self):
+        self.enabled = False
+        self.validity = {}
+        self.hits = 0
+        self.misses = 0
+
+    def reset(self, enabled=True):
+        self.enabled = enabled
+        self.validity = {}
+        self.hits = 0
+        self.misses = 0
+
+    def lookup(self, key, compute):
+        if not self.enabled:
+            return compute()
+        if key in self.validity:
+            self.hits += 1
+            return self.validity[key]
+        self.misses += 1
+        self.validity[key] = compute()
+        return self.validity[key]
+
+    def summary(self):
+        if not self.enabled:
+            return "graph validity cache: disabled"
+        total = self.hits + self.misses
+        if not total:
+            return "graph validity cache: enabled, no lookups"
+        return (
+            f"graph validity cache: {self.hits}/{total} hits "
+            f"({100.0 * self.hits / total:.1f}%), {len(self.validity)} entries"
+        )
+
+
+GRAPH_EVAL_CACHE = GraphEvalCache()
+
+
 def is_sbm_graph(G, p_intra=0.3, p_inter=0.005, strict=True, refinement_steps=100):
+
+    def compute():
+        return _is_sbm_graph_uncached(G, p_intra, p_inter, strict, refinement_steps)
+
+    if not GRAPH_EVAL_CACHE.enabled:
+        return compute()
+    params = (p_intra, p_inter, strict, refinement_steps)
+    return GRAPH_EVAL_CACHE.lookup((graph_identity_key(G), params), compute)
+
+
+def _is_sbm_graph_uncached(
+    G, p_intra=0.3, p_inter=0.005, strict=True, refinement_steps=100
+):
     """
     Check if how closely given graph matches a SBM with given probabilites by computing mean probability of Wald test statistic for each recovered parameter
     """
